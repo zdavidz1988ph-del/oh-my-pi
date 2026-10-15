@@ -22,6 +22,7 @@ import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
+import { observeModelStream } from "./model-activity";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AppleFoundationModelsOptions } from "./providers/apple-foundation-models";
@@ -896,6 +897,14 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	return observeModelStream(() => streamRequest(model, context, options));
+}
+
+function streamRequest<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: OptionsForApi<TApi>,
+): AssistantMessageEventStream {
 	if (model.resolveHeaders) {
 		return withResolvedModelHeaders(model, options?.signal, resolvedModel => stream(resolvedModel, context, options));
 	}
@@ -1232,6 +1241,14 @@ function withSupportedSamplingParams<T extends SamplingOptions>(model: Model<Api
 }
 
 export function streamSimple<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	return observeModelStream(() => streamSimpleWithSession(model, context, options));
+}
+
+function streamSimpleWithSession<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: SimpleStreamOptions,

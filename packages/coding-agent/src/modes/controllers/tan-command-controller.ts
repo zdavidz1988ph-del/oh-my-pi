@@ -70,6 +70,7 @@ export class TanCommandController {
 		}
 
 		const parentSessionId = session.sessionId;
+		const rootSessionId = session.getRootSessionId();
 		// Providers route on `promptCacheKey ?? sessionId`, so the parent's live
 		// requests may cache under a pinned key that differs from its session id
 		// (the parent being itself a fork/tan). Mirror exactly what the parent
@@ -169,6 +170,7 @@ export class TanCommandController {
 								agentDisplayName: "tan",
 								parentTaskPrefix: cloneId,
 								parentAgentId: ownerId,
+								rootSessionId,
 								agentRegistry,
 								disableExtensionDiscovery: true,
 								// `[]` is truthy and would make the child pick bindPreparedExtensions([])

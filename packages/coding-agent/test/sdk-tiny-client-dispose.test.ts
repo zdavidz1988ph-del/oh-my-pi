@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { Api, ModelSpec } from "@oh-my-pi/pi-ai";
+import { resetModelActivityForTests } from "@oh-my-pi/pi-ai/model-activity";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -35,11 +36,12 @@ class FakeTinyWorker {
 	#requests: TinyWorkerRequest[] = [];
 	#waiters: Array<(request: TinyWorkerRequest) => void> = [];
 
-	send(message: TinyWorkerRequest): void {
-		if (message.type === "ping") return;
+	send(message: TinyWorkerRequest): boolean {
+		if (message.type === "ping") return true;
 		const waiter = this.#waiters.shift();
 		if (waiter) waiter(message);
 		else this.#requests.push(message);
+		return true;
 	}
 
 	/** Resolves with the next non-ping request the client sends. */
@@ -83,6 +85,7 @@ describe("tiny-model client shutdown on session dispose", () => {
 		}
 		await titleClient.tinyTitleClient.terminate();
 		vi.restoreAllMocks();
+		resetModelActivityForTests();
 	});
 
 	const starter = async (tempDir: TempDir) => {

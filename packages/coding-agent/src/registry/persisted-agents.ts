@@ -13,6 +13,7 @@ import { persistedVibeChildIds } from "../vibe/lifecycle";
 import {
 	type AgentHistorySummary,
 	type AgentMetricsSummary,
+	type AgentRef,
 	type AgentRegistry,
 	MAIN_AGENT_ID,
 } from "./agent-registry";
@@ -29,6 +30,7 @@ const MAX_METADATA_LINES = 64;
 const MAX_ADVISOR_HISTORY_LINES = 200_000;
 
 interface PersistedAgentMetadata {
+	sessionId?: string;
 	activity?: string;
 	createdAt?: number;
 	lastActivity?: number;
@@ -309,6 +311,8 @@ async function readPersistedAgentMetadata(
 	const patchPath = `${artifactBase}.patch`;
 	const artifactFiles = Promise.all([Bun.file(outputPath).exists(), Bun.file(patchPath).exists()]);
 	let createdAt: number | undefined;
+	let sessionId: string | undefined;
+	let firstRecord = true;
 	let activity: string | undefined;
 	let history: AgentHistorySummary = {};
 	let hasSessionInit = false;
@@ -318,6 +322,10 @@ async function readPersistedAgentMetadata(
 			sessionFile,
 			entry => {
 				const record = recordOf(entry);
+				if (firstRecord) {
+					firstRecord = false;
+					if (record?.type === "session" && typeof record.id === "string") sessionId = record.id;
+				}
 				if (!record) return;
 				if (record.type === "session") {
 					createdAt ??= timestampOf(record.timestamp);
@@ -373,6 +381,7 @@ async function readPersistedAgentMetadata(
 	if (statResult.error !== undefined) throw statResult.error;
 	const file = statResult.file;
 	return {
+		sessionId,
 		activity,
 		createdAt: createdAt ?? file?.birthtimeMs,
 		lastActivity: file?.mtimeMs,
@@ -386,20 +395,29 @@ async function readPersistedAgentMetadata(
 	};
 }
 
-async function readPersistedVibeChildIds(sessionFile: string, shouldContinue: () => boolean): Promise<Set<string>> {
+async function readPersistedRootMetadata(
+	sessionFile: string,
+	shouldContinue: () => boolean,
+): Promise<{ ids: Set<string>; rootSessionId?: string }> {
 	const ids = new Set<string>();
+	let rootSessionId: string | undefined;
+	let first = true;
 	try {
 		await visitEntriesFromFileStream(
 			sessionFile,
 			entry => {
+				if (first) {
+					first = false;
+					if (entry.type === "session" && typeof entry.id === "string") rootSessionId = entry.id;
+				}
 				for (const id of persistedVibeChildIds([entry])) ids.add(id);
 			},
 			{ shouldContinue },
 		);
-		return ids;
+		return { ids, rootSessionId };
 	} catch (error) {
 		if (isFilesystemError(error)) throw error;
-		return new Set();
+		return { ids: new Set() };
 	}
 }
 
@@ -424,6 +442,13 @@ const kPersistedRosterLatches = Symbol("persistedRosterLatches");
  */
 const kPersistedRosterScanTail = Symbol("persistedRosterScanTail");
 
+interface RosterConflict {
+	ref: AgentRef | undefined;
+	sessionFile: AgentRef["sessionFile"] | undefined;
+	session: AgentRef["session"] | undefined;
+	status: AgentRef["status"] | undefined;
+}
+
 interface PersistedRosterLatch {
 	/** Settles when the root's roster scan finishes (success or logged failure). */
 	pending: Promise<void>;
@@ -440,6 +465,8 @@ interface PersistedRosterLatch {
 	 * tree — no reverse global map.
 	 */
 	owned: Map<string, string>;
+	/** 已存在但不能抢占的其他身份；冲突消失或状态改变后才重新扫描。 */
+	conflicts: Map<string, RosterConflict>;
 }
 
 interface RegistryWithPersistedRosterLatches extends AgentRegistry {
@@ -460,6 +487,45 @@ function latchOwnershipValid(registry: AgentRegistry, owned: Map<string, string>
 		if (!ref || ref.sessionFile !== sessionFile) return false;
 	}
 	return true;
+}
+
+function latchConflictsValid(registry: AgentRegistry, conflicts: Map<string, RosterConflict>): boolean {
+	for (const [id, conflict] of conflicts) {
+		const ref = registry.get(id);
+		if (
+			!ref ||
+			ref !== conflict.ref ||
+			ref.sessionFile !== conflict.sessionFile ||
+			ref.session !== conflict.session ||
+			ref.status !== conflict.status
+		)
+			return false;
+	}
+	return true;
+}
+
+function recordRosterIdentity(
+	registry: AgentRegistry,
+	id: string,
+	sessionFile: string,
+	owned?: Map<string, string>,
+	conflicts?: Map<string, RosterConflict>,
+): void {
+	const ref = registry.get(id);
+	if (ref?.kind === "sub" && ref.sessionFile === sessionFile) {
+		owned?.set(id, sessionFile);
+		conflicts?.delete(id);
+	} else {
+		conflicts?.set(id, { ref, sessionFile: ref?.sessionFile, session: ref?.session, status: ref?.status });
+	}
+}
+
+/** 只读核对正式加载器的完成状态；扫描失败或身份已被别的根会话替换都不算完整。 */
+export function isPersistedRosterReady(registry: AgentRegistry, rootSessionFile: string): boolean {
+	const latch = (registry as RegistryWithPersistedRosterLatches)[kPersistedRosterLatches]?.get(
+		path.resolve(rootSessionFile),
+	);
+	return latch?.settled === true && latch.conflicts.size === 0 && latchOwnershipValid(registry, latch.owned);
 }
 
 async function resolveRootSessionFile(registry: AgentRegistry, hint?: string | null): Promise<string | undefined> {
@@ -551,7 +617,8 @@ export async function ensurePersistedRoster(
 			// pointing at the other root's transcripts. On any missing or
 			// re-targeted ref, drop the latch and refresh this root through the
 			// same serialized scan tail so its own transcripts win again.
-			if (latchOwnershipValid(registry, existing.owned)) return root;
+			if (latchOwnershipValid(registry, existing.owned) && latchConflictsValid(registry, existing.conflicts))
+				return root;
 			if (latches.get(root) === existing) latches.delete(root);
 			// A concurrent superseded waiter may already have inserted the fresh
 			// latch; join it instead of scanning twice.
@@ -579,10 +646,14 @@ export async function ensurePersistedRoster(
 	// calls never reach here: they joined the latch above). The tail always
 	// stores a settled wrapper, so a failed scan settles it and the next root
 	// still proceeds.
-	const latch: PersistedRosterLatch = { pending: undefined!, settled: false, owned: new Map() };
+	const latch: PersistedRosterLatch = { pending: undefined!, settled: false, owned: new Map(), conflicts: new Map() };
 	const tail = taggedRegistry[kPersistedRosterScanTail] ?? Promise.resolve();
 	const scan = tail.then(() =>
-		registerPersistedSubagents(registry, root, { hydrateHistory: false, owned: latch.owned }),
+		registerPersistedSubagents(registry, root, {
+			hydrateHistory: false,
+			owned: latch.owned,
+			conflicts: latch.conflicts,
+		}),
 	);
 	taggedRegistry[kPersistedRosterScanTail] = scan.then(
 		() => {},
@@ -591,17 +662,13 @@ export async function ensurePersistedRoster(
 	latch.pending = scan.then(
 		() => {
 			const current = latches.get(root);
-			if (current) current.settled = true;
+			if (current === latch) current.settled = true;
 		},
 		error => {
 			// A failed scan drops its latch so the next call retries; the failure
 			// itself degrades to in-memory peers, never task startup.
 			const current = latches.get(root);
-			if (current && current.pending === latch.pending) {
-				latches.delete(root);
-			} else if (current) {
-				current.settled = true;
-			}
+			if (current === latch) latches.delete(root);
 			logger.warn("Persisted agent roster scan failed; using in-memory peers", {
 				rootSessionFile: root,
 				error: rosterScanError(error),
@@ -627,13 +694,17 @@ export async function registerPersistedSubagents(
 		 * against, bounded by this root's own transcript tree.
 		 */
 		owned?: Map<string, string>;
+		conflicts?: Map<string, RosterConflict>;
 	} = {},
 ): Promise<void> {
 	if (!sessionFile?.endsWith(".jsonl")) return;
+	const latches = (registry as RegistryWithPersistedRosterLatches)[kPersistedRosterLatches];
+	const rootKey = path.resolve(sessionFile);
+	if (latches?.get(rootKey)?.settled) latches.delete(rootKey);
 	const shouldContinue = options.shouldContinue ?? (() => true);
 	const hydrateHistory = options.hydrateHistory ?? true;
 	if (!shouldContinue()) return;
-	const vibeOwnedIds = await readPersistedVibeChildIds(sessionFile, shouldContinue);
+	const { ids: vibeOwnedIds, rootSessionId } = await readPersistedRootMetadata(sessionFile, shouldContinue);
 	if (!shouldContinue()) return;
 	const root = sessionFile.slice(0, -6);
 	const transcripts: PersistedTranscript[] = [];
@@ -645,7 +716,9 @@ export async function registerPersistedSubagents(
 		transcripts,
 		shouldContinue,
 		sessionFile,
+		rootSessionId,
 		options.owned,
+		options.conflicts,
 	);
 	if (!hydrateHistory || !shouldContinue()) return;
 	let nextTranscript = 0;
@@ -671,7 +744,9 @@ async function registerPersistedSubagentsFromDir(
 	transcripts: PersistedTranscript[],
 	shouldContinue: () => boolean,
 	rootSessionFile: string,
+	rootSessionId: string | undefined,
 	owned?: Map<string, string>,
+	conflicts?: Map<string, RosterConflict>,
 ): Promise<void> {
 	if (!shouldContinue()) return;
 	let entries: fs.Dirent[];
@@ -770,7 +845,7 @@ async function registerPersistedSubagentsFromDir(
 			typeof existing.sessionFile === "string" &&
 			!sessionFileBelongsToRoot(existing.sessionFile, rootSessionFile);
 		if (existing && !replaceable) {
-			if (existing.sessionFile === sessionFile) {
+			if (existing.kind === "sub" && existing.sessionFile === sessionFile) {
 				owned?.set(id, sessionFile);
 				transcripts.push({
 					id,
@@ -778,6 +853,13 @@ async function registerPersistedSubagentsFromDir(
 					createdAt: existing.createdAt,
 					lastActivity: existing.lastActivity,
 				});
+			} else if (conflicts) {
+				const metadata = await readPersistedAgentMetadata(
+					sessionFile,
+					nestedPatchFilesFor(dir, entry.name, entries),
+				);
+				if (!shouldContinue()) return;
+				if (!metadata.incomplete || tombstoned) recordRosterIdentity(registry, id, sessionFile, owned, conflicts);
 			}
 		} else {
 			const expected = existing ?? null;
@@ -799,6 +881,8 @@ async function registerPersistedSubagentsFromDir(
 					displayName: id,
 					kind: "sub" as const,
 					parentId: parentId ?? MAIN_AGENT_ID,
+					rootSessionId,
+					sessionId: metadata.sessionId,
 					session: null,
 					sessionFile,
 					activity: metadata.activity,
@@ -819,6 +903,7 @@ async function registerPersistedSubagentsFromDir(
 					});
 				}
 			}
+			if (!metadata.incomplete || tombstoned) recordRosterIdentity(registry, id, sessionFile, owned, conflicts);
 		}
 		// A transcript stem is not proof of a child directory: "." and ".."
 		// revisit ancestors, and symlinks can point back into the same tree.
@@ -831,7 +916,9 @@ async function registerPersistedSubagentsFromDir(
 				transcripts,
 				shouldContinue,
 				rootSessionFile,
+				rootSessionId,
 				owned,
+				conflicts,
 			);
 		}
 	}

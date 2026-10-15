@@ -69,6 +69,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
 	| { id?: string; type: "set_event_filter"; events: string[] | null; messageUpdates?: RpcMessageUpdates }
 	| { id?: string; type: "get_subagents" }
+	| { id?: string; type: "get_runtime_activity" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
 	| { id?: string; type: "cancel_subagent"; subagentId: string }
 	| { id?: string; type: "steer_subagent"; subagentId: string; message: string }
@@ -320,6 +321,7 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	runtimeActivityVersion?: number;
 }
 
 export interface RpcChunkFrame {
@@ -350,6 +352,32 @@ export interface RpcSubagentSnapshot {
 	lastUpdate: number;
 	progress?: AgentProgress;
 	parentToolCallId?: string;
+}
+
+/** 当前引擎名册的只读事实，不含消息、工具参数、凭据或本机路径。 */
+export interface RpcAgentActivity {
+	id: string;
+	sessionId: string | null;
+	parentId: string | null;
+	name: string;
+	kind: "main" | "sub";
+	status: string;
+	modelRequestIds: string[];
+	toolCallIds: string[];
+	pendingQuestionIds: string[];
+	waitingForResult: boolean;
+	complete: boolean;
+}
+
+/** 每次查询都是完整替换快照；序号不是增量事件编号。 */
+export interface RpcRuntimeActivity {
+	version: 1;
+	instanceId: string;
+	sessionId: string;
+	sequence: number;
+	complete: boolean;
+	gaps: string[];
+	agents: RpcAgentActivity[];
 }
 
 export interface RpcSubagentMessagesResult {
@@ -456,6 +484,13 @@ export type RpcResponse =
 			command: "get_subagents";
 			success: true;
 			data: { subagents: RpcSubagentSnapshot[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_runtime_activity";
+			success: true;
+			data: RpcRuntimeActivity;
 	  }
 	| {
 			id?: string;

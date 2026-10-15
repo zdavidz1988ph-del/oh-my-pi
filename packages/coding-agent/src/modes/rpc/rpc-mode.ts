@@ -17,6 +17,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { captureModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
@@ -85,6 +86,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
+import { RpcRuntimeActivityReader } from "./rpc-runtime-activity";
 import type {
 	RpcAbortAndRestoreQueueResult,
 	RpcCommand,
@@ -195,12 +197,34 @@ export type PendingExtensionRequest = {
 /** Pending extension UI request map that can fail closed when the RPC client disconnects. */
 export class RpcPendingExtensionRequests extends Map<string, PendingExtensionRequest> {
 	#closedError: Error | undefined;
+	readonly #owners = new Map<string, string | undefined>();
+	readonly #sessionId: (() => string) | undefined;
+
+	constructor(sessionId?: () => string) {
+		super();
+		this.#sessionId = sessionId;
+	}
+
+	getOwnerSessionId(id: string): string | undefined {
+		return this.#owners.get(id);
+	}
+
+	override delete(id: string): boolean {
+		this.#owners.delete(id);
+		return super.delete(id);
+	}
+
+	override clear(): void {
+		this.#owners.clear();
+		super.clear();
+	}
 
 	override set(id: string, request: PendingExtensionRequest): this {
 		if (this.#closedError) {
 			request.reject(this.#closedError);
 			return this;
 		}
+		this.#owners.set(id, captureModelActivityOwner()?.sessionId ?? this.#sessionId?.());
 		return super.set(id, request);
 	}
 
@@ -422,6 +446,7 @@ const BACKGROUND_COMMANDS: ReadonlySet<string> = new Set<RpcCommand["type"]>([
 	"predict_word",
 	"live_start",
 	"btw_cancel",
+	"get_runtime_activity",
 ]);
 
 /**
@@ -1365,6 +1390,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+			runtimeActivityVersion: 1,
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1404,7 +1430,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const sessionEvents = new RpcSessionEventForwarder(output);
 	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);
 
-	const pendingExtensionRequests = new RpcPendingExtensionRequests();
+	const pendingExtensionRequests = new RpcPendingExtensionRequests(() => session.sessionId);
+	const runtimeActivity = new RpcRuntimeActivityReader(session, pendingExtensionRequests);
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 	// Live frames go straight to `output`, so `set_event_filter` (session events only) never drops them.
@@ -2209,6 +2236,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				return success(id, "get_subagents", { subagents: subagentRegistry.getSubagents() });
 			}
 
+			case "get_runtime_activity":
+				return success(id, "get_runtime_activity", runtimeActivity.snapshot(goalTurnScheduled));
+
 			case "get_subagent_messages": {
 				if (!subagentRegistry) {
 					return error(id, "get_subagent_messages", "Subagent event bus is unavailable");
@@ -2646,7 +2676,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	});
 
 	const dispatchFrameDeps: RpcInputFrameDeps = {
-		handleCommand,
+		handleCommand: command => session.runInModelActivityScope(() => handleCommand(command)),
 		output,
 		errorResponse: error,
 		trackBackgroundTask: task => shutdownCoordinator.track(task),

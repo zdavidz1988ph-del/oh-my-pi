@@ -397,6 +397,7 @@ class ManualCompactionNoOpError extends Error {
 /** Capabilities borrowed from the owning AgentSession. */
 export interface SessionMaintenanceHost {
 	agent: Agent;
+	runInModelActivityScope<T>(action: () => T): T;
 	sessionManager: SessionManager;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
@@ -3474,43 +3475,45 @@ export class SessionMaintenance {
 			}
 
 			try {
-				return await compact(
-					this.#host.obfuscatePreparationForProvider(preparation),
-					candidate,
-					this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
-					this.#host.obfuscateTextForProvider(customInstructions),
-					signal,
-					{
-						...options,
-						metadata: this.#host.agent.metadataForProvider(candidate.provider),
-						convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
-						buildProviderContext: (summarized, retained, signal) =>
-							this.#host.buildLiveProviderContext(summarized, retained, signal),
-						isUserAuthored: isUserAuthoredMessage,
-						telemetry,
-						// Honor the user's /model thinking selection (incl. `off`) on
-						// the manual `/compact` path. Clamped per-model inside compact()
-						// via resolveCompactionEffort so unsupported-effort models
-						// (xai-oauth/grok-build) don't trip requireSupportedEffort.
-						thinkingLevel: this.#host.thinkingLevel(),
-						tools: this.#host.agent.state.tools,
-						sessionId: this.#host.sessionId(),
-						promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
-						providerSessionState: this.#host.providerSessionState,
-						preferWebsockets: this.#host.preferWebsockets(),
-						// Route every summarization HTTP request through the
-						// session's side-stream transport so the provider
-						// concurrency cap (e.g. providers.ollama-cloud.maxConcurrency)
-						// brackets compaction the same way it brackets the live
-						// agent turn — without this, multiple ollama-cloud
-						// subagents auto/manually compacting issued uncapped
-						// summary requests in parallel (chatgpt-codex review on
-						// #3751).
-						completeImpl: async (requestModel, requestContext, requestOptions) => {
-							const stream = await this.#host.sideStreamFn(requestModel, requestContext, requestOptions);
-							return stream.result();
+				return await this.#host.runInModelActivityScope(() =>
+					compact(
+						this.#host.obfuscatePreparationForProvider(preparation),
+						candidate,
+						this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
+						this.#host.obfuscateTextForProvider(customInstructions),
+						signal,
+						{
+							...options,
+							metadata: this.#host.agent.metadataForProvider(candidate.provider),
+							convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
+							buildProviderContext: (summarized, retained, signal) =>
+								this.#host.buildLiveProviderContext(summarized, retained, signal),
+							isUserAuthored: isUserAuthoredMessage,
+							telemetry,
+							// Honor the user's /model thinking selection (incl. `off`) on
+							// the manual `/compact` path. Clamped per-model inside compact()
+							// via resolveCompactionEffort so unsupported-effort models
+							// (xai-oauth/grok-build) don't trip requireSupportedEffort.
+							thinkingLevel: this.#host.thinkingLevel(),
+							tools: this.#host.agent.state.tools,
+							sessionId: this.#host.sessionId(),
+							promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
+							providerSessionState: this.#host.providerSessionState,
+							preferWebsockets: this.#host.preferWebsockets(),
+							// Route every summarization HTTP request through the
+							// session's side-stream transport so the provider
+							// concurrency cap (e.g. providers.ollama-cloud.maxConcurrency)
+							// brackets compaction the same way it brackets the live
+							// agent turn — without this, multiple ollama-cloud
+							// subagents auto/manually compacting issued uncapped
+							// summary requests in parallel (chatgpt-codex review on
+							// #3751).
+							completeImpl: async (requestModel, requestContext, requestOptions) => {
+								const stream = await this.#host.sideStreamFn(requestModel, requestContext, requestOptions);
+								return stream.result();
+							},
 						},
-					},
+					),
 				);
 			} catch (error) {
 				const id = AIError.classify(error instanceof NativeCompactionError ? error.cause : error, candidate.api);
@@ -4909,40 +4912,43 @@ export class SessionMaintenance {
 					let attempt = 0;
 					while (true) {
 						try {
-							compactResult = await compact(
-								this.#host.obfuscatePreparationForProvider(preparation),
-								candidate,
-								this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
-								undefined,
-								autoCompactionSignal,
-								{
-									promptOverride: this.#host.obfuscateTextForProvider(compactionPrep.hookPrompt),
-									extraContext: compactionPrep.hookContext,
-									remoteSystemPrompt: this.#host.agent.state.systemPrompt,
-									metadata: this.#host.agent.metadataForProvider(candidate.provider),
-									initiatorOverride: "agent",
-									convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
-									buildProviderContext: (summarized, retained, signal) =>
-										this.#host.buildLiveProviderContext(summarized, retained, signal),
-									isUserAuthored: isUserAuthoredMessage,
-									telemetry,
-									// Honor the user's /model thinking selection on the
-									// auto-compaction path — the most-fired compaction
-									// site. Clamped per-model inside compact() via
-									// resolveCompactionEffort.
-									thinkingLevel: this.#host.thinkingLevel(),
-									tools: this.#host.agent.state.tools,
-									sessionId: this.#host.sessionId(),
-									promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
-									providerSessionState: this.#host.providerSessionState,
-									preferWebsockets: this.#host.preferWebsockets(),
-									codexCompaction,
-									// This loop already retries the whole compaction attempt on
-									// transient errors, so the summarization oneshots must not
-									// retry too — the budgets would multiply and each outer
-									// wait would stack on top of an inner backoff.
-									oneshotRetry: false,
-								},
+							const activePreparation = preparation;
+							compactResult = await this.#host.runInModelActivityScope(() =>
+								compact(
+									this.#host.obfuscatePreparationForProvider(activePreparation),
+									candidate,
+									this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
+									undefined,
+									autoCompactionSignal,
+									{
+										promptOverride: this.#host.obfuscateTextForProvider(compactionPrep.hookPrompt),
+										extraContext: compactionPrep.hookContext,
+										remoteSystemPrompt: this.#host.agent.state.systemPrompt,
+										metadata: this.#host.agent.metadataForProvider(candidate.provider),
+										initiatorOverride: "agent",
+										convertToLlm: messages => this.#host.convertToLlmForSideRequest(messages),
+										buildProviderContext: (summarized, retained, signal) =>
+											this.#host.buildLiveProviderContext(summarized, retained, signal),
+										isUserAuthored: isUserAuthoredMessage,
+										telemetry,
+										// Honor the user's /model thinking selection on the
+										// auto-compaction path — the most-fired compaction
+										// site. Clamped per-model inside compact() via
+										// resolveCompactionEffort.
+										thinkingLevel: this.#host.thinkingLevel(),
+										tools: this.#host.agent.state.tools,
+										sessionId: this.#host.sessionId(),
+										promptCacheKey: this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId,
+										providerSessionState: this.#host.providerSessionState,
+										preferWebsockets: this.#host.preferWebsockets(),
+										codexCompaction,
+										// This loop already retries the whole compaction attempt on
+										// transient errors, so the summarization oneshots must not
+										// retry too — the budgets would multiply and each outer
+										// wait would stack on top of an inner backoff.
+										oneshotRetry: false,
+									},
+								),
 							);
 							break;
 						} catch (error) {

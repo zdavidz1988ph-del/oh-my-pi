@@ -24,6 +24,7 @@ import {
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { captureModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { validateAgentAccountPools } from "../config/account-pools";
@@ -96,6 +97,7 @@ export interface VibeOwnerScope {
 
 export interface VibeParentSession {
 	getAgentId?: () => string | null;
+	getRootSessionId?: () => string | undefined;
 	getSessionId?: () => string | null;
 	getSessionFile: () => string | null;
 	sessionManager?: ToolSession["sessionManager"] &
@@ -1325,6 +1327,7 @@ export class VibeSessionRegistry {
 			parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 			parentTelemetry: session.getTelemetry?.(),
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
+			rootSessionId: captureModelActivityOwner()?.rootSessionId ?? session.getRootSessionId?.(),
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 			oauthAccountPools: Object.hasOwn(agentAccountPools, record.agent.name)
 				? agentAccountPools[record.agent.name]

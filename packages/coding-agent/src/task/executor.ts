@@ -563,6 +563,8 @@ export interface ExecutorOptions {
 	 * passes its own `getAgentId()`).
 	 */
 	parentAgentId?: string;
+	/** 派工方在开始工作时捕获的真实根会话。 */
+	rootSessionId?: string;
 	/**
 	 * Keep the finished subagent addressable in the registry for IRC/revival.
 	 * Defaults to true. Eval bridge agents are programmatic one-shot helpers and
@@ -4348,6 +4350,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					parentMnemopiSessionState: options.parentMnemopiSessionState,
 					parentTaskPrefix: id,
 					parentAgentId: options.parentAgentId,
+					rootSessionId: options.rootSessionId,
 					agentId: id,
 					agentDisplayName: agent.name,
 					agentName: agent.name,

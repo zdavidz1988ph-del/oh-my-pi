@@ -65,6 +65,10 @@ export interface AgentRef {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	/** 创建或真实恢复时确定的根会话，不能用后来复用的父 ID 猜测。 */
+	rootSessionId?: string;
+	/** 代理本身的原生会话编号，停放后仍保留，避免同名新代理混用旧活动。 */
+	sessionId?: string;
 	status: AgentStatus;
 	/** Null exactly when parked/aborted. */
 	session: AgentSession | null;
@@ -94,6 +98,8 @@ export interface RegisterInput {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	rootSessionId?: string;
+	sessionId?: string;
 	session: AgentSession | null;
 	sessionFile?: string | null;
 	status?: AgentStatus;
@@ -143,6 +149,8 @@ export class AgentRegistry {
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
+			rootSessionId: input.rootSessionId,
+			sessionId: input.sessionId,
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,

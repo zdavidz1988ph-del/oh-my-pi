@@ -102,6 +102,7 @@ describe("async speculative compaction", () => {
 				throw new Error("The compact seam should be used instead of the side stream");
 			},
 			providerSessionState: new Map(),
+			runInModelActivityScope: <T>(action: () => T): T => action(),
 			preferWebsockets: () => undefined,
 			model: () => model,
 			thinkingLevel: () => undefined,

@@ -15,6 +15,7 @@ export const frameDefs = {
 			"supportedProtocolVersions?": "number.integer[]",
 			"maxFrameBytes?": "number.integer",
 			"maxReassembledFrameBytes?": "number.integer",
+			"runtimeActivityVersion?": doc("number.integer", "真实身份和活动的只读快照版本。"),
 		},
 		"First frame after startup; transport fields are absent on servers without protocol v2.",
 	),

@@ -44,6 +44,7 @@ import type {
 	RpcPromptResultFrame,
 	RpcRemoveQueuedMessageResult,
 	RpcResponse,
+	RpcRuntimeActivity,
 	RpcSessionSettledFrame,
 	RpcSessionState,
 	RpcSubagentEventFrame,
@@ -880,6 +881,11 @@ export class RpcClient {
 	async getSubagents(): Promise<RpcSubagentSnapshot[]> {
 		const response = await this.#send({ type: "get_subagents" });
 		return this.#getData<{ subagents: RpcSubagentSnapshot[] }>(response).subagents;
+	}
+
+	/** 读取真实身份及模型、工具、待答问题的完整只读快照。 */
+	async getRuntimeActivity(): Promise<RpcRuntimeActivity> {
+		return this.#getData<RpcRuntimeActivity>(await this.#send({ type: "get_runtime_activity" }));
 	}
 
 	/**

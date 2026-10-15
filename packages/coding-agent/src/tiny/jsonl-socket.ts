@@ -22,10 +22,11 @@ export class LineParser {
 	}
 }
 
-/** Write one JSON line; silently dropped once the socket is gone (the close handler reports that). */
-export function writeJsonLine(socket: net.Socket, message: unknown): void {
-	if (socket.destroyed) return;
+/** false 仅表示确认未写出；write 的 false 是背压，仍属于可能已发送。 */
+export function writeJsonLine(socket: net.Socket, message: unknown): boolean {
+	if (socket.destroyed || !socket.writable) return false;
 	socket.write(`${JSON.stringify(message)}\n`);
+	return true;
 }
 
 /** Dial a Unix socket or named pipe with a bounded connect; the socket is switched to UTF-8 strings. */

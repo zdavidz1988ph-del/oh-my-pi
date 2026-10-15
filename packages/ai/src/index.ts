@@ -13,6 +13,18 @@ export * from "./rerank";
 export * from "./speech";
 export * from "./transcription";
 export * from "./video";
+export {
+	captureModelActivityOwner,
+	getModelActivity,
+	type ModelActivityLease,
+	type ModelActivityOwner,
+	type ModelActivityRecord,
+	modelActivityInstanceId,
+	observeModelOperation,
+	observeModelStream,
+	retainModelActivity,
+	withModelActivityOwner,
+} from "./model-activity";
 export * from "./oneshot-retry";
 export * from "./provider-details";
 export * from "./provider-session-state";

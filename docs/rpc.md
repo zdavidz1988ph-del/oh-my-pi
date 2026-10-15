@@ -33,6 +33,23 @@ Behavior notes:
 - When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, pending stdout is delivered, and normal shutdown exits with code `0`. A session-persistence failure still latched at disposal exits with code `1` after delivering its `notice` frame.
 - Responses/events are written as one JSON object per line.
 
+## 只读运行活动快照
+
+本分支基于 18.8.9，启动帧额外声明 `runtimeActivityVersion: 1`。支持时可发送：
+
+```json
+{ "id": "activity-1", "type": "get_runtime_activity" }
+```
+
+响应的 `data` 包含 `version`、进程级 `instanceId`、当前根 `sessionId`、递增 `sequence`、`complete`、`gaps` 和 `agents`。每个身份含 `id`、真实 `sessionId`（构造中可为 `null`）、`parentId`、`name`、`kind`、原生 `status`、`modelRequestIds`、`toolCallIds`、`pendingQuestionIds`、`waitingForResult` 和 `complete`。
+
+- 身份来自原生注册表及当前根会话的持久名册，不使用父工具调用编号代替子身份。恢复名册、切换会话、未接入的自定义流和归属缺失期间返回不完整快照。旧根会话的迟到活动不借用新身份。
+- 模型请求由实际流入口、远端压缩和本机生成请求记录。取消调用方等待不表示工作器结束；本机生成收到实际回复后才结算。已发送请求断线但不能确认工作器停止时，保留不可观测状态，不冒充空闲。下载及预热探测不算模型生成。
+- 同名身份被另一个根的运行／已取消身份占用时，名册保持不完整，不抢占、不复活；冲突未变化不重复扫盘，释放或停放后才重扫。失联请求按身份合并，最多保留 512 个未知身份，超限转成单个进程级未知，直到进程退出也不假装恢复完整。每身份最多输出 1024 个真实请求编号，超限明确标记不完整；未知缺口不作为请求编号输出。
+- 查询独立于事件订阅，并绕过长命令串行队列；不会发起模型请求、工具调用、批准或派工。不返回正文、参数、凭据及本机路径。
+- `status: "running"` 是注册表生命周期，不代表模型正在运行。只有完整的身份活动记录中的非空 `modelRequestIds` 才能证明该身份有模型请求；`complete: false` 或丢帧不能解释为空闲。
+- 消费端应按办公室／认证连接、`instanceId`、根会话、身份会话和 `id` 组合区分人物；过期、断线和旧序号需保守处理。只有完整名册才能确认身份离开。
+
 ## Transport and Framing
 
 Protocol v1 stdout frames are a single JSON object followed by `\n`. The server caps each physical stdout frame at 1 MiB, including the newline. Inbound frames are always one unchunked JSONL object; clients SHOULD keep them within the advertised physical-frame limit. Input is not reassembled from `rpc_chunk` frames.

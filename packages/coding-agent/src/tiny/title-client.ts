@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import type * as net from "node:net";
 import * as path from "node:path";
 import type { Subprocess } from "bun";
+import { retainModelActivity, type ModelActivityLease } from "@oh-my-pi/pi-ai";
 import { $env, getTinyWorkerRuntimeDir, logger, prompt } from "@oh-my-pi/pi-utils";
 import packageJson from "../../package.json" with { type: "json" };
 import type { Setting } from "../config/registry";
@@ -66,7 +67,9 @@ const READY_TIMEOUT_MS = 120_000;
 /** Time for a stale worker to honour `shutdown` and release its socket. */
 const SHUTDOWN_WAIT_MS = 5_000;
 
-type WorkerHandle = RefCountedWorkerHandle<TinyWorkerRequest, TinyWorkerResponse>;
+type WorkerHandle = Omit<RefCountedWorkerHandle<TinyWorkerRequest, TinyWorkerResponse>, "send"> & {
+	send(message: TinyWorkerRequest): boolean;
+};
 
 type PendingRequest =
 	| { kind: "title"; modelKey: TinyLocalModelKey; source: string; resolve: (title: string | null) => void }
@@ -202,7 +205,7 @@ function createSocketWorkerHandle(socket: net.Socket, logPath: string): WorkerHa
 	});
 	return {
 		send(message) {
-			writeJsonLine(socket, message);
+			return writeJsonLine(socket, message);
 		},
 		onMessage(handler) {
 			messages.add(handler);
@@ -232,9 +235,10 @@ function createSocketWorkerHandle(socket: net.Socket, logPath: string): WorkerHa
  * reaching a worker means probing and possibly spawning; sends queue until
  * the connection lands, and a failed connect surfaces through `onError`.
  */
-class LazyWorkerHandle implements WorkerHandle {
+class LazyWorkerHandle implements RefCountedWorkerHandle<TinyWorkerRequest, TinyWorkerResponse> {
 	#inner: WorkerHandle | null = null;
 	#queue: TinyWorkerRequest[] = [];
+	#sent = new Set<string>();
 	#messages = new Set<(message: TinyWorkerResponse) => void>();
 	#errors = new Set<(error: Error) => void>();
 	#refed = false;
@@ -249,6 +253,7 @@ class LazyWorkerHandle implements WorkerHandle {
 				}
 				this.#inner = inner;
 				inner.onMessage(message => {
+					if (message.type === "text" || message.type === "error") this.#sent.delete(message.id);
 					for (const handler of this.#messages) handler(message);
 				});
 				inner.onError(error => {
@@ -258,7 +263,15 @@ class LazyWorkerHandle implements WorkerHandle {
 				else inner.unref();
 				const queued = this.#queue;
 				this.#queue = [];
-				for (const message of queued) inner.send(message);
+				try {
+					for (const message of queued) {
+						if (this.#terminated) break;
+						this.send(message);
+					}
+				} catch (error) {
+					const failure = error instanceof Error ? error : new Error(String(error));
+					for (const handler of this.#errors) handler(failure);
+				}
 			},
 			(error: unknown) => {
 				if (this.#terminated) return;
@@ -269,8 +282,18 @@ class LazyWorkerHandle implements WorkerHandle {
 	}
 
 	send(message: TinyWorkerRequest): void {
-		if (this.#inner) this.#inner.send(message);
-		else this.#queue.push(message);
+		if (this.#inner) {
+			// 先登记以兼容同步回复；传输确认未写出时撤销，异常则保守保留。
+			if (message.type === "chat") this.#sent.add(message.id);
+			if (!this.#inner.send(message)) {
+				this.#sent.delete(message.id);
+				throw new Error("本机模型连接已关闭，请求没有写出");
+			}
+		} else this.#queue.push(message);
+	}
+
+	wasSent(id: string): boolean {
+		return this.#sent.has(id);
 	}
 
 	onMessage(handler: (message: TinyWorkerResponse) => void): () => void {
@@ -527,7 +550,7 @@ function extractTinyTitle(text: string, sourceText: string): string | null {
 
 /** One connection per model this process has used; the worker behind it is shared machine-wide. */
 interface ModelWorker {
-	handle: WorkerHandle;
+	handle: LazyWorkerHandle;
 	unsubscribe: () => void;
 	refed: boolean;
 	/** {@link tinyModelEnvKey} when the connection was made. */
@@ -542,6 +565,8 @@ interface ModelWorker {
 export class TinyTitleClient {
 	#workers = new Map<TinyLocalModelKey, ModelWorker>();
 	#pending = new Map<string, PendingRequest>();
+	/** 独立于调用方等待：取消后仍等工作器的真实回复。 */
+	#activities = new Map<string, { worker: ModelWorker; lease: ModelActivityLease }>();
 	/** Models whose load/generation failed, keyed to the device/dtype they failed under. */
 	#failedModels = new Map<TinyLocalModelKey, string>();
 	#progressListeners = new Set<(event: TinyTitleProgressEvent) => void>();
@@ -681,8 +706,10 @@ export class TinyTitleClient {
 			this.#pending.set(request.id, pending);
 			this.#syncWorkerRef(pending.modelKey);
 			signal?.addEventListener("abort", abort, { once: true });
+			if (pending.kind !== "load") this.#activities.set(request.id, { worker, lease: retainModelActivity() });
 			worker.handle.send(request);
 		} catch (error) {
+			this.#loseActivity(request.id);
 			const message = error instanceof Error ? error.message : String(error);
 			logger.debug("tiny-title: local request failed", {
 				modelKey: pending.modelKey,
@@ -704,6 +731,7 @@ export class TinyTitleClient {
 		for (const pending of this.#pending.values()) this.#fail(pending, undefined);
 		this.#pending.clear();
 		for (const worker of workers) {
+			this.#loseWorkerActivities(worker);
 			worker.unsubscribe();
 			try {
 				await worker.handle.terminate();
@@ -721,6 +749,7 @@ export class TinyTitleClient {
 			// requests finish on the old worker.
 			if (existing.envKey === envKey || this.#hasPending(modelKey)) return existing;
 			this.#workers.delete(modelKey);
+			this.#loseWorkerActivities(existing);
 			existing.unsubscribe();
 			void existing.handle.terminate();
 		}
@@ -760,6 +789,11 @@ export class TinyTitleClient {
 		if (message.type === "progress") {
 			this.#emitProgress(message.event);
 			return;
+		}
+		const activity = this.#activities.get(message.id);
+		if (activity) {
+			activity.lease.finish();
+			this.#activities.delete(message.id);
 		}
 		// Any answer settles the model's load, even for an abandoned request;
 		// MLX `chat` loads send no `ready` of their own.
@@ -812,10 +846,26 @@ export class TinyTitleClient {
 		for (const listener of this.#progressListeners) listener(event);
 	}
 
+	/** 断开客户端不能证明共享工作器已停止；未发送的请求则可以结算。 */
+	#loseActivity(id: string): void {
+		const activity = this.#activities.get(id);
+		if (!activity) return;
+		if (activity.worker.handle.wasSent(id)) activity.lease.unobservable();
+		else activity.lease.finish();
+		this.#activities.delete(id);
+	}
+
+	#loseWorkerActivities(worker: ModelWorker): void {
+		for (const [id, activity] of this.#activities) {
+			if (activity.worker === worker) this.#loseActivity(id);
+		}
+	}
+
 	/** Forget the model's connection and fail every request still in flight for it. Returns how many failed. */
 	#dropWorker(modelKey: TinyLocalModelKey, error: string): number {
 		const worker = this.#workers.get(modelKey);
 		if (worker) {
+			this.#loseWorkerActivities(worker);
 			this.#workers.delete(modelKey);
 			worker.unsubscribe();
 			void worker.handle.terminate();

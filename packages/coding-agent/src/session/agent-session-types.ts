@@ -324,6 +324,12 @@ export interface AgentSessionConfig {
 	agentId?: string;
 	/** Whether this is a top-level or subagent session. */
 	agentKind?: "main" | "sub";
+	/** 子会话创建时明确继承的根身份。 */
+	rootSessionId?: string;
+	/** 在真实模型与工具入口绑定本会话归属，不改变调用本身。 */
+	runInModelActivityScope?: <T>(action: () => T) => T;
+	/** 已接入统一活动观测的原始主流函数；被外部替换后不能再声称完整。 */
+	modelActivityStreamFn?: StreamFn;
 	/** Provider-facing session ID override. */
 	providerSessionId?: string;
 	/** OAuth account pools enforced on the session's key lookups; the session lifts them on dispose. */

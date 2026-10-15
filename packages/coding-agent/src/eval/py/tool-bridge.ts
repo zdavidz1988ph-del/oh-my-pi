@@ -8,6 +8,7 @@
  * the JavaScript bridge uses.
  */
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
+import { captureModelActivityOwner, type ModelActivityOwner } from "@oh-my-pi/pi-ai";
 import type { ToolSession } from "../../tools";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
 import { bridgeValueFromToolResult, callSessionTool, type JsStatusEvent } from "../js/tool-bridge";
@@ -43,7 +44,9 @@ interface BridgeServer {
 	stop: () => Promise<void>;
 }
 
-const registrations = new Map<string, PyToolBridgeEntry>();
+type RegisteredPyToolBridgeEntry = PyToolBridgeEntry & { readonly modelActivityOwner?: ModelActivityOwner };
+
+const registrations = new Map<string, RegisteredPyToolBridgeEntry>();
 let serverPromise: Promise<BridgeServer> | null = null;
 
 function markExpectedBridgeShutdownError(error: unknown): error is Error {
@@ -104,7 +107,7 @@ async function waitForSpeculativeClaim<T>(claim: Promise<T>, name: string, signa
 async function callSessionToolPromptOnAbort(
 	name: string,
 	args: unknown,
-	entry: PyToolBridgeEntry,
+	entry: RegisteredPyToolBridgeEntry,
 	identity?: RuntimeCallIdentity,
 ): Promise<unknown> {
 	if (entry.abortRequested?.()) {
@@ -124,6 +127,7 @@ async function callSessionToolPromptOnAbort(
 	}
 	const call = callSessionTool(name, args, {
 		session: entry.toolSession,
+		modelActivityOwner: entry.modelActivityOwner,
 		signal: entry.signal,
 		emitStatus: entry.emitStatus,
 		identity,
@@ -268,9 +272,10 @@ function bridgeRegistrationKey(sessionId: string, runId: string): string {
 
 export function registerPyToolBridge(sessionId: string, runId: string, entry: PyToolBridgeEntry): () => void {
 	const key = bridgeRegistrationKey(sessionId, runId);
-	registrations.set(key, entry);
+	const registered = { ...entry, modelActivityOwner: captureModelActivityOwner() };
+	registrations.set(key, registered);
 	return () => {
-		if (registrations.get(key) === entry) {
+		if (registrations.get(key) === registered) {
 			registrations.delete(key);
 		}
 	};

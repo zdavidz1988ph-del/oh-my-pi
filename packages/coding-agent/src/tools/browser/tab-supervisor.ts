@@ -1,3 +1,4 @@
+import { captureModelActivityOwner, type ModelActivityOwner } from "@oh-my-pi/pi-ai";
 import {
 	getProjectDir,
 	getPuppeteerDir,
@@ -69,6 +70,7 @@ export interface PendingRun {
 	resolve(result: RunResultOk): void;
 	reject(error: unknown): void;
 	session: ToolSession;
+	modelActivityOwner?: ModelActivityOwner;
 	signal?: AbortSignal;
 	toolCalls: Map<string, AbortController>;
 	/**
@@ -789,6 +791,7 @@ async function runInTabWithSnapshot(
 		resolve,
 		reject,
 		session: opts.session ?? ({} as ToolSession),
+		modelActivityOwner: captureModelActivityOwner(),
 		signal: opts.signal,
 		toolCalls: new Map(),
 		closeAc,
@@ -842,6 +845,7 @@ async function runInTabWithSnapshot(
 				timeoutMs: opts.timeoutMs,
 				signal: runSignal,
 				session: pending.session,
+				modelActivityOwner: pending.modelActivityOwner,
 				snapshot,
 			}).then(resolve, reject);
 			return await promise;
@@ -1587,6 +1591,7 @@ async function dispatchToolCall(
 	try {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.session,
+			modelActivityOwner: pending.modelActivityOwner,
 			signal: ctrl.signal,
 			emitStatus: () => {
 				// Status events from tool calls aren't piped back to user code yet; the worker

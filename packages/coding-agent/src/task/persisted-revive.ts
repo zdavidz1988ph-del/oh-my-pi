@@ -213,6 +213,7 @@ export function createPersistedSubagentReviverFactory(
 							: ref.displayName,
 					parentTaskPrefix: ref.id,
 					parentAgentId: ref.parentId,
+					rootSessionId: ref.rootSessionId,
 					oauthAccountPools,
 					expectedAgentRef: expectedRef,
 					taskDepth,
