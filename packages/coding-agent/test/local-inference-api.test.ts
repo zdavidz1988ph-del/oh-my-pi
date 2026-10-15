@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Socket } from "node:net";
+import { resetModelActivityForTests } from "@oh-my-pi/pi-ai/model-activity";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	completeSimple,
 	type Context,
+	getModelActivity,
+	observeModelOperation,
+	withModelActivityOwner,
 	streamSimple,
 	type Usage,
 	type UserMessage,
@@ -15,6 +20,7 @@ import {
 	registerLocalInferenceApi,
 } from "@oh-my-pi/pi-coding-agent/tiny/local-inference-api";
 import { TINY_LOCAL_MODELS } from "@oh-my-pi/pi-coding-agent/tiny/models";
+import { writeJsonLine } from "@oh-my-pi/pi-coding-agent/tiny/jsonl-socket";
 import {
 	type TinyModelChatOptions,
 	TinyTitleClient,
@@ -26,6 +32,7 @@ import type {
 	TinyWorkerResponse,
 } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
 
+afterEach(resetModelActivityForTests);
 const SOURCE_ID = "omp/local-inference";
 const model = getBundledModel("local", "lfm2.5-230m")!;
 
@@ -75,8 +82,9 @@ class FakeTinyWorker {
 		this.#onSend = onSend;
 	}
 
-	send(message: TinyWorkerRequest): void {
+	send(message: TinyWorkerRequest): boolean {
 		this.#onSend(message, this);
+		return true;
 	}
 
 	onMessage(handler: (message: TinyWorkerResponse) => void): () => void {
@@ -258,18 +266,30 @@ describe("tiny model chat client", () => {
 		}
 	});
 
-	it("resolves an in-flight chat as null when its signal aborts", async () => {
-		const worker = new FakeTinyWorker(() => {});
+	it("取消只结束调用方等待，实际回复前仍保留同一模型请求", async () => {
+		const sent = Promise.withResolvers<TinyWorkerRequest>();
+		const worker = new FakeTinyWorker(request => sent.resolve(request));
 		const client = new TinyTitleClient(async () => worker);
 		const controller = new AbortController();
+		const rootSessionId = "tiny-cancel-activity";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
 
 		try {
-			const completion = client.chat("lfm2.5-230m", [{ role: "user", content: "hello" }], {
-				signal: controller.signal,
-			});
+			const completion = withModelActivityOwner({ agentId: "Main", sessionId: rootSessionId, rootSessionId }, () =>
+				observeModelOperation(() =>
+					client.chat("lfm2.5-230m", [{ role: "user", content: "hello" }], {
+						signal: controller.signal,
+					}),
+				),
+			);
+			const request = await sent.promise;
+			const before = activity();
+			expect(before).toHaveLength(1);
 			controller.abort();
-
 			expect(await completion).toBeNull();
+			expect(activity()).toEqual(before);
+			worker.emit({ type: "text", id: request.id, text: "迟到结果" });
+			expect(activity()).toEqual([]);
 		} finally {
 			await client.terminate();
 		}
@@ -288,6 +308,183 @@ describe("tiny model chat client", () => {
 			client.prewarm("qwen3-1.7b");
 			expect(await firstRequest.promise).toMatchObject({ type: "ping" });
 			expect(await client.generate("qwen3-1.7b", "title this session")).toBe("Memory Model Title");
+		} finally {
+			await client.terminate();
+		}
+	});
+
+	it("并发标题保持各自归属，丢失已发送请求的连接只能标记未知", async () => {
+		const requests: TinyWorkerRequest[] = [];
+		const sent = Promise.withResolvers<void>();
+		const worker = new FakeTinyWorker(request => {
+			requests.push(request);
+			if (requests.length === 2) sent.resolve();
+		});
+		const client = new TinyTitleClient(async () => worker);
+		const rootSessionId = "tiny-title-disconnect";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		const generate = (agentId: string) =>
+			withModelActivityOwner({ agentId, sessionId: agentId, rootSessionId }, () =>
+				client.generate("lfm2.5-230m", "生成标题"),
+			);
+		const first = generate("first");
+		const second = generate("second");
+		try {
+			await sent.promise;
+			expect(
+				activity()
+					.map(call => call.agentId)
+					.sort(),
+			).toEqual(["first", "second"]);
+			worker.emit({ type: "text", id: requests[0]!.id, text: "第一个标题</title>" });
+			expect(await first).toBe("第一个标题");
+			expect(activity().map(call => call.agentId)).toEqual(["second"]);
+			await client.terminate();
+			expect(await second).toBeNull();
+			expect(activity()).toMatchObject([{ agentId: "second", observable: false }]);
+		} finally {
+			await client.terminate();
+		}
+	});
+
+	it("其他工作器和非终态消息不能结算正在运行的模型", async () => {
+		const requests: { request: TinyWorkerRequest; worker: FakeTinyWorker }[] = [];
+		const bothSent = Promise.withResolvers<void>();
+		const onSend = (request: TinyWorkerRequest, worker: FakeTinyWorker) => {
+			requests.push({ request, worker });
+			if (requests.length === 2) bothSent.resolve();
+		};
+		const firstWorker = new FakeTinyWorker(onSend);
+		const secondWorker = new FakeTinyWorker(onSend);
+		const client = new TinyTitleClient(async key => key === "lfm2.5-230m" ? firstWorker : secondWorker);
+		const rootSessionId = "tiny-worker-isolation";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		const start = (key: "lfm2.5-230m" | "qwen3-1.7b") => withModelActivityOwner(
+			{ agentId: key, sessionId: key, rootSessionId }, () => client.chat(key, []));
+		const first = start("lfm2.5-230m");
+		const second = start("qwen3-1.7b");
+		try {
+			await bothSent.promise;
+			const before = activity();
+			const firstRequest = requests.find(entry => entry.worker === firstWorker)!.request;
+			const secondRequest = requests.find(entry => entry.worker === secondWorker)!.request;
+			secondWorker.emit({ type: "text", id: firstRequest.id, text: "不属于这个工作器" });
+			firstWorker.emit({ type: "loaded", id: firstRequest.id });
+			expect(activity()).toEqual(before);
+			firstWorker.emit({ type: "text", id: firstRequest.id, text: "第一个结果" });
+			expect(await first).toBe("第一个结果");
+			expect(activity()).toMatchObject([{ agentId: "qwen3-1.7b", observable: true }]);
+			secondWorker.emit({ type: "text", id: secondRequest.id, text: "第二个结果" });
+			expect(await second).toBe("第二个结果");
+			expect(activity()).toEqual([]);
+		} finally {
+			await client.terminate();
+		}
+	});
+
+	it("连接排队不算模型运行，发送时仍沿用原请求身份", async () => {
+		const connection = Promise.withResolvers<FakeTinyWorker>();
+		const sent = Promise.withResolvers<TinyWorkerRequest>();
+		const worker = new FakeTinyWorker(request => sent.resolve(request));
+		const client = new TinyTitleClient(async () => connection.promise);
+		const rootSessionId = "tiny-connect-queue";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		const result = withModelActivityOwner({ agentId: "original", sessionId: "original", rootSessionId },
+			() => client.chat("lfm2.5-230m", []));
+		try {
+			expect(activity()).toEqual([]);
+			withModelActivityOwner({ agentId: "unrelated", sessionId: "unrelated", rootSessionId },
+				() => connection.resolve(worker));
+			const request = await sent.promise;
+			expect(activity()).toMatchObject([{ agentId: "original", observable: true }]);
+			worker.emit({ type: "text", id: request.id, text: "真实结果" });
+			expect(await result).toBe("真实结果");
+			expect(activity()).toEqual([]);
+		} finally {
+			connection.resolve(worker);
+			await client.terminate();
+		}
+	});
+
+	it("连续取消且工作器不回包时记账有上限，超限不能假装空闲", async () => {
+		let sent = Promise.withResolvers<TinyWorkerRequest>();
+		const worker = new FakeTinyWorker(request => sent.resolve(request));
+		const client = new TinyTitleClient(async () => worker);
+		const rootSessionId = "tiny-cancel-limit";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		try {
+			for (let index = 0; index < 600; index++) {
+				sent = Promise.withResolvers<TinyWorkerRequest>();
+				const controller = new AbortController();
+				const result = withModelActivityOwner({ agentId: "Main", sessionId: rootSessionId, rootSessionId },
+					() => client.chat("lfm2.5-230m", [], { signal: controller.signal }));
+				await sent.promise;
+				controller.abort();
+				expect(await result).toBeNull();
+			}
+			expect(activity().filter(call => call.observable)).toHaveLength(256);
+			expect(activity().filter(call => !call.observable)).toHaveLength(1);
+			await client.terminate();
+			expect(activity()).toMatchObject([{ agentId: "Main", observable: false }]);
+			expect(activity()).toHaveLength(1);
+		} finally {
+			await client.terminate();
+		}
+	});
+
+	it("连接建立失败且从未发送的请求不遗留模型活动", async () => {
+		const rootSessionId = "tiny-connect-failed";
+		const client = new TinyTitleClient(async () => {
+			throw new Error("本机模拟连接失败");
+		});
+		try {
+			const result = await withModelActivityOwner({ agentId: "Main", sessionId: rootSessionId, rootSessionId }, () =>
+				client.generate("lfm2.5-230m", "生成标题"),
+			);
+			expect(result).toBeNull();
+			expect(getModelActivity().filter(call => call.rootSessionId === rootSessionId)).toEqual([]);
+		} finally {
+			await client.terminate();
+		}
+	});
+	for (const queued of [true, false]) {
+		it(`已关闭连接确认未发送时结算活动：${queued ? "连接队列回放" : "已连接句柄"}`, async () => {
+			const rootSessionId = `tiny-closed-${queued}`;
+			const socket = new Socket();
+			socket.destroy();
+			const worker = new FakeTinyWorker((request, current) => {
+				if (request.type === "chat") current.emit({ type: "text", id: request.id, text: "预先完成" });
+			});
+			const client = new TinyTitleClient(async () => worker);
+			try {
+				if (!queued) expect(await client.chat("lfm2.5-230m", [])).toBe("预先完成");
+				worker.send = request => writeJsonLine(socket, request);
+				const result = await withModelActivityOwner(
+					{ agentId: "Main", sessionId: rootSessionId, rootSessionId },
+					() => client.chat("lfm2.5-230m", []),
+				);
+				expect(result).toBeNull();
+				expect(getModelActivity().filter(call => call.rootSessionId === rootSessionId)).toEqual([]);
+			} finally {
+				await client.terminate();
+			}
+		});
+	}
+
+	it("队列回放期间可能已经写出的异常结算调用方但保留未知缺口", async () => {
+		const rootSessionId = "tiny-uncertain-send";
+		const worker = new FakeTinyWorker(() => {
+			throw new Error("无法确认写入是否完成");
+		});
+		const client = new TinyTitleClient(async () => worker);
+		try {
+			const result = await withModelActivityOwner({ agentId: "Main", sessionId: rootSessionId, rootSessionId }, () =>
+				client.chat("lfm2.5-230m", []),
+			);
+			expect(result).toBeNull();
+			expect(getModelActivity().filter(call => call.rootSessionId === rootSessionId)).toMatchObject([
+				{ agentId: "Main", observable: false },
+			]);
 		} finally {
 			await client.terminate();
 		}

@@ -24,6 +24,7 @@ import type {
 	ServiceTierByFamily,
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
+import { withModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
@@ -819,6 +820,8 @@ export interface CreateAgentSessionOptions {
 	 * top-level "Main" session, which has no parent.
 	 */
 	parentAgentId?: string;
+	/** 派工时捕获的真实根会话；子会话不得通过复用的父名字猜测。 */
+	rootSessionId?: string;
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
@@ -2204,6 +2207,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? agentKind;
+	const inheritedRootSessionId = options.expectedAgentRef?.rootSessionId ?? options.rootSessionId;
+	const getRootSessionId = () => (agentKind === "main" ? sessionManager.getSessionId() : inheritedRootSessionId);
+	const runInModelActivityScope = <T>(action: () => T): T => {
+		const rootSessionId = getRootSessionId();
+		return withModelActivityOwner(
+			rootSessionId
+				? { agentId: resolvedAgentId, sessionId: sessionManager.getSessionId(), rootSessionId }
+				: undefined,
+			action,
+		);
+	};
 	let registeredAgentRef: AgentRef | undefined;
 	/**
 	 * Forget the agent ref on teardown — unless it is a retained terminal ref.
@@ -2315,6 +2329,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			getRootSessionId,
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
 			getEvalBridgeToolNames: () => session?.getEvalBridgeToolNames() ?? [],
@@ -4050,6 +4065,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			displayName: resolvedAgentDisplayName,
 			kind: agentKind,
 			parentId: options.parentAgentId,
+			rootSessionId: getRootSessionId(),
+			sessionId: sessionManager.getSessionId(),
 			session: null,
 			sessionFile: sessionManager.getSessionFile() ?? null,
 			status: "running" as const,
@@ -4272,8 +4289,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// request, not the process-wide switch (the newest effect holder's): concurrent ACP/SDK
 		// sessions in one process each keep their own policy.
 		const settingsAwareStreamFn: StreamFn = (streamModel, context, streamOptions) =>
-			withCredentialRedaction(cfgSecretsEnabled.get(settings), () =>
-				settingsBoundStreamFn(streamModel, context, streamOptions),
+			runInModelActivityScope(() =>
+				withCredentialRedaction(cfgSecretsEnabled.get(settings), () =>
+					settingsBoundStreamFn(streamModel, context, streamOptions),
+				),
 			);
 		// Primary-agent (and its auto-learn capture twin) provider options read per
 		// request, so `/settings` changes to budgets, Kimi format, or the Codex
@@ -4320,6 +4339,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
 
 		agent = new Agent({
+			runInModelActivityScope,
 			initialState: {
 				systemPrompt,
 				model,
@@ -4650,6 +4670,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentKind,
+			rootSessionId: inheritedRootSessionId,
+			runInModelActivityScope,
+			modelActivityStreamFn: agent.streamFn,
 			providerSessionId: options.providerSessionId,
 			accountPoolScope,
 			providerPromptCacheKeySource,
@@ -4987,6 +5010,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						const vibeRegistry = VibeSessionRegistry.global();
 						const vibeParentSession = {
 							getAgentId: () => resolvedAgentId,
+							getRootSessionId,
 							getSessionId: () => sessionManager.getSessionId(),
 							getSessionFile: () => sessionManager.getSessionFile() ?? null,
 							sessionManager,

@@ -12,6 +12,7 @@ import {
 	streamSimple,
 } from "@oh-my-pi/pi-ai/stream";
 import type { Context, Model, RawSseEvent } from "@oh-my-pi/pi-ai/types";
+import { getModelActivity, withModelActivityOwner } from "../src/model-activity";
 
 function context(): Context {
 	return {
@@ -152,17 +153,27 @@ describe("provider in-flight request limits", () => {
 				if (event.data.includes('"choices":[]')) usageSeen.resolve();
 			},
 		};
-		const firstResult = stream(model, context(), options).result();
+		const rootSessionId = "provider-transport-boundary";
+		const activity = () => getModelActivity().filter(record => record.rootSessionId === rootSessionId);
+		const firstResult = withModelActivityOwner({ agentId: "first", sessionId: "first", rootSessionId },
+			() => stream(model, context(), options).result());
 		await usageSeen.promise;
-		const secondResult = stream(model, context(), options).result();
-		// Exercise the real filesystem-backed lease scheduler while the first
-		// transport is parked waiting for its terminal SSE frame.
-		await Bun.sleep(150);
-		releaseDone.resolve();
+		const secondWaiting = nextLimiterWait();
+		const secondResult = withModelActivityOwner({ agentId: "second", sessionId: "second", rootSessionId },
+			() => stream(model, context(), options).result());
+		try {
+			await secondWaiting;
+			// 收到正文和用量不是传输结束；排队的第二个请求还不能显示为模型运行。
+			expect(activity()).toMatchObject([{ agentId: "first", observable: true }]);
+			expect(activity()).toHaveLength(1);
+		} finally {
+			releaseDone.resolve();
+		}
 		const [first, second] = await Promise.all([firstResult, secondResult]);
 		expect(first.content).toEqual([{ type: "text", text: "first" }]);
 		expect(second.content).toEqual([{ type: "text", text: "second" }]);
 		expect(overlapped).toBe(false);
+		expect(activity()).toEqual([]);
 	}, 10_000);
 
 	test("releases its provider lease before reporting terminal completion", async () => {

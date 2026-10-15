@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { captureModelActivityOwner, type ModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
 	createWorkerHandle,
@@ -63,6 +64,7 @@ interface PendingRun {
 	runId: string;
 	runState: VmRunState;
 	toolSession: ToolSession;
+	modelActivityOwner?: ModelActivityOwner;
 	shadowCell?: EvalShadowCellSession;
 	resolve(value: { value: unknown }): void;
 	reject(error: Error): void;
@@ -240,6 +242,7 @@ export async function invokeJsTool(
 			},
 		},
 		toolSession: options.session,
+		modelActivityOwner: captureModelActivityOwner(),
 		resolve,
 		reject,
 		toolCalls: new Map(),
@@ -512,6 +515,7 @@ async function runOnce(
 		runId,
 		runState: options.runState,
 		toolSession: options.session,
+		modelActivityOwner: captureModelActivityOwner(),
 		shadowCell: getActiveEvalShadowCell(),
 		resolve,
 		reject,
@@ -818,6 +822,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 	try {
 		const value = await callSessionTool(msg.name, msg.args, {
 			session: pending.toolSession,
+			modelActivityOwner: pending.modelActivityOwner,
 			signal: ctrl.signal,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,

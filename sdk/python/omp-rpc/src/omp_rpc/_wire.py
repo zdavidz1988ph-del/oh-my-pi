@@ -873,6 +873,33 @@ class SubagentSnapshot:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class AgentActivity:
+    id: str
+    session_id: str | None
+    parent_id: str | None
+    name: str
+    kind: Literal["main", "sub"]
+    status: str
+    model_request_ids: tuple[str, ...]
+    tool_call_ids: tuple[str, ...]
+    pending_question_ids: tuple[str, ...]
+    waiting_for_result: bool
+    complete: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class RuntimeActivity:
+    """完整替换的只读快照；序号属于本进程，缺失事实不能解释为空闲。"""
+    version: int
+    instance_id: str
+    session_id: str
+    sequence: int
+    complete: bool
+    gaps: tuple[str, ...]
+    agents: tuple[AgentActivity, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SubagentMessages:
     """Incremental subagent transcript read."""
     session_file: str
@@ -1200,6 +1227,8 @@ class ReadyEvent:
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    runtime_activity_version: int | None = None
+    """真实身份和活动的只读快照版本。"""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2177,6 +2206,36 @@ def parse_subagent_snapshot(value: object, path: str = "SubagentSnapshot") -> Su
     )
 
 
+def parse_agent_activity(value: object, path: str = "AgentActivity") -> AgentActivity:
+    payload = expect_object(value, path)
+    return AgentActivity(
+        id=required(payload, "id", decode_str, path),
+        session_id=required(payload, "sessionId", nullable(decode_str), path),
+        parent_id=required(payload, "parentId", nullable(decode_str), path),
+        name=required(payload, "name", decode_str, path),
+        kind=required(payload, "kind", cast('Decoder[Literal["main", "sub"]]', literal(frozenset({"main", "sub"}))), path),
+        status=required(payload, "status", decode_str, path),
+        model_request_ids=required(payload, "modelRequestIds", array(decode_str), path),
+        tool_call_ids=required(payload, "toolCallIds", array(decode_str), path),
+        pending_question_ids=required(payload, "pendingQuestionIds", array(decode_str), path),
+        waiting_for_result=required(payload, "waitingForResult", decode_bool, path),
+        complete=required(payload, "complete", decode_bool, path),
+    )
+
+
+def parse_runtime_activity(value: object, path: str = "RuntimeActivity") -> RuntimeActivity:
+    payload = expect_object(value, path)
+    return RuntimeActivity(
+        version=required(payload, "version", decode_int, path),
+        instance_id=required(payload, "instanceId", decode_str, path),
+        session_id=required(payload, "sessionId", decode_str, path),
+        sequence=required(payload, "sequence", decode_int, path),
+        complete=required(payload, "complete", decode_bool, path),
+        gaps=required(payload, "gaps", array(decode_str), path),
+        agents=required(payload, "agents", array(parse_agent_activity), path),
+    )
+
+
 def parse_subagent_messages(value: object, path: str = "SubagentMessages") -> SubagentMessages:
     payload = expect_object(value, path)
     return SubagentMessages(
@@ -2555,6 +2614,7 @@ def parse_ready_event(value: object, path: str = "ReadyEvent") -> ReadyEvent:
         supported_protocol_versions=optional(payload, "supportedProtocolVersions", array(decode_int), path),
         max_frame_bytes=optional(payload, "maxFrameBytes", decode_int, path),
         max_reassembled_frame_bytes=optional(payload, "maxReassembledFrameBytes", decode_int, path),
+        runtime_activity_version=optional(payload, "runtimeActivityVersion", decode_int, path),
     )
 
 
@@ -3234,6 +3294,11 @@ class WireClient:
         params: dict[str, object] = {}
         return required(expect_object(self._command("get_subagents", params), "get_subagents"), "subagents", array(parse_subagent_snapshot), "get_subagents")
 
+    def get_runtime_activity(self) -> RuntimeActivity:
+        """读取当前根会话及其原生子代理的完整活动事实，不包含消息或工具参数。"""
+        params: dict[str, object] = {}
+        return parse_runtime_activity(self._command("get_runtime_activity", params), "get_runtime_activity")
+
     def get_subagent_messages(self, *, subagent_id: str | None = None, session_file: str | None = None, from_byte: int | None = None) -> SubagentMessages:
         """Read a subagent transcript by id or registered session file (`subagentId` wins)."""
         params: dict[str, object] = {}
@@ -3706,6 +3771,7 @@ __all__ = [
     "AbortAndRestoreQueueResult",
     "AdvisorCostChangedEvent",
     "AdvisorYieldedEvent",
+    "AgentActivity",
     "AgentEndEvent",
     "AgentMessage",
     "AgentSource",
@@ -3834,6 +3900,7 @@ __all__ = [
     "RpcAgentEvent",
     "RpcFrameErrorEvent",
     "RpcNotification",
+    "RuntimeActivity",
     "SelectOptionDetail",
     "SelectUiRequest",
     "SessionCredits",
@@ -3898,6 +3965,7 @@ __all__ = [
     "parse_abort_and_restore_queue_result",
     "parse_advisor_cost_changed_event",
     "parse_advisor_yielded_event",
+    "parse_agent_activity",
     "parse_agent_end_event",
     "parse_agent_message",
     "parse_agent_start_event",
@@ -4004,6 +4072,7 @@ __all__ = [
     "parse_retry_fallback_succeeded_event",
     "parse_rpc_agent_event",
     "parse_rpc_frame_error_event",
+    "parse_runtime_activity",
     "parse_select_option_detail",
     "parse_select_ui_request",
     "parse_session_credits",

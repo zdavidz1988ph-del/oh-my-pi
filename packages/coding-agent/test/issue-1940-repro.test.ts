@@ -1,9 +1,11 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import { resetModelActivityForTests } from "@oh-my-pi/pi-ai/model-activity";
 import { SttClient } from "@oh-my-pi/pi-coding-agent/stt/asr-client";
 import type { SttWorkerInbound, SttWorkerOutbound } from "@oh-my-pi/pi-coding-agent/stt/asr-protocol";
 import { TinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import type { TinyWorkerRequest, TinyWorkerResponse } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
 
+afterEach(resetModelActivityForTests);
 class FakeTinyWorker {
 	terminated = false;
 	refCalls = 0;
@@ -18,9 +20,10 @@ class FakeTinyWorker {
 		this.#onSend = onSend;
 	}
 
-	send(message: TinyWorkerRequest): void {
+	send(message: TinyWorkerRequest): boolean {
 		if (message.type !== "ping") this.firstRequest.resolve(message);
 		this.#onSend(message, this);
+		return true;
 	}
 
 	onMessage(handler: (message: TinyWorkerResponse) => void): () => void {

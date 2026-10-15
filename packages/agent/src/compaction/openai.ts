@@ -16,6 +16,8 @@
  */
 
 import { attach, create, Flag, ProviderHttpError } from "@oh-my-pi/pi-ai/error";
+import { observeModelOperation, withoutModelTransportActivity } from "@oh-my-pi/pi-ai/model-activity";
+import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { getCodexAttestationHeader } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-compaction";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
@@ -820,6 +822,8 @@ export async function requestOpenAiRemoteCompaction(
 	let fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	if (isBedrockOpenAIUrl(model.baseUrl)) {
 		({ model, apiKey, fetch: fetchImpl } = await prepareBedrockCompactionRequest(model, apiKey, opts?.fetch, signal));
+	} else {
+		fetchImpl = transportFetch(model, opts?.fetch);
 	}
 	const endpoint = resolveOpenAiCompactEndpoint(model);
 	const requestModel = resolveOpenAiCompactModel(model);
@@ -870,7 +874,7 @@ export async function requestOpenAiRemoteCompaction(
 			headers[OPENAI_HEADERS.ACCOUNT_ID] = accountId;
 		}
 		applyCodexResidencyHeader(headers, apiKey);
-		const attestation = await getCodexAttestationHeader(accountId);
+		const attestation = await withoutModelTransportActivity(() => getCodexAttestationHeader(accountId));
 		if (attestation) {
 			headers[OPENAI_HEADERS.ATTESTATION] = attestation;
 		}
@@ -1004,59 +1008,64 @@ export async function requestRemoteCompaction(
 			}
 		: { systemPrompt: request.systemPrompt, prompt: request.prompt, maxTokens: request.maxTokens };
 
-	const response = await (opts?.fetch ?? fetch)(endpoint, {
-		method: "POST",
-		headers,
-		body: stringifyJson(body),
-		signal: ptree.combineSignals(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
-	});
-
-	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
-		logger.warn("Remote compaction failed", {
-			endpoint,
-			status: response.status,
-			statusText: response.statusText,
-			errorText,
+	const fetchImpl = opts?.model ? transportFetch(opts.model, opts.fetch) : (opts?.fetch ?? fetch);
+	const runRequest = async (): Promise<RemoteCompactionResponse> => {
+		const response = await fetchImpl(endpoint, {
+			method: "POST",
+			headers,
+			body: stringifyJson(body),
+			signal: ptree.combineSignals(signal, opts?.timeoutMs ?? REMOTE_COMPACTION_TIMEOUT_MS),
 		});
-		throw new ProviderHttpError(
-			`Remote compaction failed (${response.status} ${response.statusText})`,
-			response.status,
-			{
-				headers: response.headers,
-			},
-		);
-	}
 
-	if (isChatCompletions) {
-		type ChatCompletionsResponse = {
-			choices?: Array<{
-				message?: {
-					content?: string | Array<{ type?: string; text?: string }> | null;
-				};
-			}>;
-		};
-		const data = (await response.json()) as ChatCompletionsResponse | undefined;
-		const choice = data?.choices?.[0]?.message?.content;
-		let summary: string | undefined;
-		if (typeof choice === "string") {
-			summary = choice;
-		} else if (Array.isArray(choice)) {
-			summary = choice
-				.filter((part): part is { type?: string; text: string } => typeof part?.text === "string")
-				.map(part => part.text)
-				.join("");
+		if (!response.ok) {
+			const errorText = await response.text().catch(() => "");
+			logger.warn("Remote compaction failed", {
+				endpoint,
+				status: response.status,
+				statusText: response.statusText,
+				errorText,
+			});
+			throw new ProviderHttpError(
+				`Remote compaction failed (${response.status} ${response.statusText})`,
+				response.status,
+				{
+					headers: response.headers,
+				},
+			);
 		}
-		if (typeof summary !== "string" || summary.length === 0) {
-			throw new Error("Remote compaction response missing choices[0].message.content");
+
+		if (isChatCompletions) {
+			type ChatCompletionsResponse = {
+				choices?: Array<{
+					message?: {
+						content?: string | Array<{ type?: string; text?: string }> | null;
+					};
+				}>;
+			};
+			const data = (await response.json()) as ChatCompletionsResponse | undefined;
+			const choice = data?.choices?.[0]?.message?.content;
+			let summary: string | undefined;
+			if (typeof choice === "string") {
+				summary = choice;
+			} else if (Array.isArray(choice)) {
+				summary = choice
+					.filter((part): part is { type?: string; text: string } => typeof part?.text === "string")
+					.map(part => part.text)
+					.join("");
+			}
+			if (typeof summary !== "string" || summary.length === 0) {
+				throw new Error("Remote compaction response missing choices[0].message.content");
+			}
+			return { summary };
 		}
-		return { summary };
-	}
 
-	const data = (await response.json()) as RemoteCompactionResponse | undefined;
-	if (!data || typeof data.summary !== "string") {
-		throw new Error("Remote compaction response missing summary");
-	}
+		const data = (await response.json()) as RemoteCompactionResponse | undefined;
+		if (!data || typeof data.summary !== "string") {
+			throw new Error("Remote compaction response missing summary");
+		}
 
-	return data;
+		return data;
+	};
+	// 无模型参数的既有调用也只从实际发送开始计时，覆盖完整响应正文。
+	return opts?.model ? runRequest() : observeModelOperation(runRequest);
 }

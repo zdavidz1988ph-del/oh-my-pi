@@ -7,6 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
+import { captureModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { resolveAgentModelSelection, resolveConfiguredModelPatterns } from "../config/model-resolver";
@@ -604,6 +605,7 @@ function buildExecutorOptions(
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
+		rootSessionId: captureModelActivityOwner()?.rootSessionId ?? session.getRootSessionId?.(),
 		parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 	};
 }

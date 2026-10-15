@@ -89,6 +89,8 @@ export function ensureAntigravityVersion(fetcher: FetchImpl = fetch, signal?: Ab
 				});
 				if (response.ok) {
 					discoveredAntigravityVersion = parseAntigravityManifestVersion(await response.text());
+				} else {
+					await response.body?.cancel();
 				}
 			} catch {
 				// Silent: the pinned fallback remains valid when version discovery fails.

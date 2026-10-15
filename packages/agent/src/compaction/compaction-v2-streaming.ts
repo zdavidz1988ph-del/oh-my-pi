@@ -24,6 +24,7 @@ import {
 	resolveOpenAIRequestSetup,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { captureOpenAIHttpError } from "@oh-my-pi/pi-ai/utils/openai-http";
+import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 import { isBedrockOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	applyCodexResidencyHeader,
@@ -266,6 +267,8 @@ export async function requestCompactionV2Streaming(
 			apiKey,
 			fetch: fetchImpl,
 		} = await prepareBedrockCompactionRequest(model, apiKey, options?.fetch, signal));
+	} else {
+		fetchImpl = transportFetch(model, options?.fetch);
 	}
 	const endpoint = getCompactionV2Endpoint(model);
 	if (!endpoint) {

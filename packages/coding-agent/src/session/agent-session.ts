@@ -79,7 +79,7 @@ import type {
 	UsageReport,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Effort, serviceTierFamily, streamSimple, withModelActivityOwner } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
@@ -947,6 +947,9 @@ export class AgentSession implements SettingsScope {
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
+	#rootSessionId: string | undefined;
+	#runInModelActivityScope?: <T>(action: () => T) => T;
+	#modelActivityStreamFn?: StreamFn;
 	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
@@ -2116,6 +2119,9 @@ export class AgentSession implements SettingsScope {
 		this.#loopGuards = new LoopGuards(streamGuardsHost);
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
+		this.#rootSessionId = config.rootSessionId;
+		this.#runInModelActivityScope = config.runInModelActivityScope;
+		this.#modelActivityStreamFn = config.modelActivityStreamFn;
 		// A subagent's streamed text reaches no output sink until the run settles
 		// (the parent sees only the yield), so a failed turn's partial prose is
 		// replay-safe and transient provider errors after it stay retryable —
@@ -2261,6 +2267,7 @@ export class AgentSession implements SettingsScope {
 
 		const maintenanceHost: SessionMaintenanceHost = {
 			agent: this.agent,
+			runInModelActivityScope: action => this.runInModelActivityScope(action),
 			sessionManager: this.sessionManager,
 			settings: this.settings,
 			modelRegistry: this.#modelRegistry,
@@ -2633,6 +2640,21 @@ export class AgentSession implements SettingsScope {
 
 	getAgentId(): string | undefined {
 		return this.#agentId;
+	}
+
+	/** 根会话切换后使用真实新身份；子会话保留创建时捕获的根。 */
+	getRootSessionId(): string | undefined {
+		return this.#agentKind === "main" ? this.sessionId : this.#rootSessionId;
+	}
+
+	runInModelActivityScope<T>(action: () => T): T {
+		return this.#runInModelActivityScope
+			? this.#runInModelActivityScope(action)
+			: withModelActivityOwner(undefined, action);
+	}
+
+	get modelActivityTracked(): boolean {
+		return this.#runInModelActivityScope !== undefined && this.agent.streamFn === this.#modelActivityStreamFn;
 	}
 
 	/** Dequeue the next HARD forced tool choice for the upcoming LLM call, dropping
@@ -9496,17 +9518,19 @@ export class AgentSession implements SettingsScope {
 		if (titleSignal.aborted) return null;
 		// The title request carries user text, so it follows this session's own credential
 		// redaction policy like its conversation requests (see `settingsAwareStreamFn`).
-		const title = await withCredentialRedaction(cfgSecretsEnabled.get(this.settings), () =>
-			generateSessionTitle(
-				firstMessage,
-				this.#modelRegistry,
-				this.settings,
-				sessionId,
-				this.model,
-				provider => buildSessionMetadata(sessionId, provider, this.#modelRegistry.authStorage),
-				customSystemPrompt ?? this.#titleSystemPrompt,
-				titleSignal,
-				parentSessionId,
+		const title = await this.runInModelActivityScope(() =>
+			withCredentialRedaction(cfgSecretsEnabled.get(this.settings), () =>
+				generateSessionTitle(
+					firstMessage,
+					this.#modelRegistry,
+					this.settings,
+					sessionId,
+					this.model,
+					provider => buildSessionMetadata(sessionId, provider, this.#modelRegistry.authStorage),
+					customSystemPrompt ?? this.#titleSystemPrompt,
+					titleSignal,
+					parentSessionId,
+				),
 			),
 		);
 		if (await this.#sessionGenerationChanged(sessionGeneration)) return null;
@@ -9816,11 +9840,14 @@ export class AgentSession implements SettingsScope {
 
 			// Emit session_switch event with reason "new" to hooks
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "new",
-					previousSessionFile,
-				});
+				const runner = this.#extensionRunner;
+				await this.runInModelActivityScope(() =>
+					runner.emit({
+						type: "session_switch",
+						reason: "new",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			return true;
@@ -9938,11 +9965,14 @@ export class AgentSession implements SettingsScope {
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "fork",
-					previousSessionFile,
-				});
+				const runner = this.#extensionRunner;
+				await this.runInModelActivityScope(() =>
+					runner.emit({
+						type: "session_switch",
+						reason: "fork",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			return true;
@@ -11437,11 +11467,14 @@ export class AgentSession implements SettingsScope {
 
 			// Emit session_switch event to hooks
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "resume",
-					previousSessionFile,
-				});
+				const runner = this.#extensionRunner;
+				await this.runInModelActivityScope(() =>
+					runner.emit({
+						type: "session_switch",
+						reason: "resume",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);
@@ -11801,11 +11834,14 @@ export class AgentSession implements SettingsScope {
 
 			// Emit session_branch event to hooks (after branch completes)
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_branch",
-					reason,
-					previousSessionFile,
-				});
+				const runner = this.#extensionRunner;
+				await this.runInModelActivityScope(() =>
+					runner.emit({
+						type: "session_branch",
+						reason,
+						previousSessionFile,
+					}),
+				);
 			}
 
 			if (!skipConversationRestore) {
@@ -11921,11 +11957,14 @@ export class AgentSession implements SettingsScope {
 			const sessionContext = this.buildDisplaySessionContext();
 
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_branch",
-					reason: "btw",
-					previousSessionFile,
-				});
+				const runner = this.#extensionRunner;
+				await this.runInModelActivityScope(() =>
+					runner.emit({
+						type: "session_branch",
+						reason: "btw",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);

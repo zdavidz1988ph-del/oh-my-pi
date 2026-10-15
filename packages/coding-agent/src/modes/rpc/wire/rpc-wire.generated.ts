@@ -692,6 +692,31 @@ export interface SubagentSnapshot {
 	parentToolCallId?: string;
 }
 
+export interface AgentActivity {
+	id: string;
+	sessionId: string | null;
+	parentId: string | null;
+	name: string;
+	kind: "main" | "sub";
+	status: string;
+	modelRequestIds: string[];
+	toolCallIds: string[];
+	pendingQuestionIds: string[];
+	waitingForResult: boolean;
+	complete: boolean;
+}
+
+/** 完整替换的只读快照；序号属于本进程，缺失事实不能解释为空闲。 */
+export interface RuntimeActivity {
+	version: number;
+	instanceId: string;
+	sessionId: string;
+	sequence: number;
+	complete: boolean;
+	gaps: string[];
+	agents: AgentActivity[];
+}
+
 /** Incremental subagent transcript read. */
 export interface SubagentMessages {
 	sessionFile: string;
@@ -997,6 +1022,8 @@ export interface ReadyEvent {
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
+	/** 真实身份和活动的只读快照版本。 */
+	runtimeActivityVersion?: number;
 }
 
 export type PromptStatus = "completed" | "aborted" | "error";
@@ -1806,6 +1833,7 @@ export interface RpcWireCommands {
 	set_subagent_subscription: { params: SetSubagentSubscriptionParams; result: SetSubagentSubscriptionResult };
 	set_event_filter: { params: SetEventFilterParams; result: SetEventFilterResult };
 	get_subagents: { params: undefined; result: GetSubagentsResult };
+	get_runtime_activity: { params: undefined; result: RuntimeActivity };
 	get_subagent_messages: { params: GetSubagentMessagesParams; result: SubagentMessages };
 	cancel_subagent: { params: CancelSubagentParams; result: CancelSubagentResult };
 	steer_subagent: { params: SteerSubagentParams; result: undefined };

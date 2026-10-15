@@ -287,6 +287,17 @@
 				"clientOmit": []
 			},
 			{
+				"name": "get_runtime_activity",
+				"doc": "读取当前根会话及其原生子代理的完整活动事实，不包含消息或工具参数。",
+				"params": null,
+				"result": "RuntimeActivity",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "get_subagent_messages",
 				"doc": "Read a subagent transcript by id or registered session file (`subagentId` wins).",
 				"params": "GetSubagentMessagesParams",
@@ -3242,6 +3253,126 @@
 				"lastUpdate"
 			]
 		},
+		"AgentActivity": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"sessionId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"parentId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"name": {
+					"type": "string"
+				},
+				"kind": {
+					"enum": [
+						"main",
+						"sub"
+					],
+					"type": "string"
+				},
+				"status": {
+					"type": "string"
+				},
+				"modelRequestIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"toolCallIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"pendingQuestionIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"waitingForResult": {
+					"type": "boolean"
+				},
+				"complete": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"id",
+				"sessionId",
+				"parentId",
+				"name",
+				"kind",
+				"status",
+				"modelRequestIds",
+				"toolCallIds",
+				"pendingQuestionIds",
+				"waitingForResult",
+				"complete"
+			]
+		},
+		"RuntimeActivity": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"type": "integer"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"sessionId": {
+					"type": "string"
+				},
+				"sequence": {
+					"type": "integer"
+				},
+				"complete": {
+					"type": "boolean"
+				},
+				"gaps": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"agents": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/AgentActivity"
+					}
+				}
+			},
+			"required": [
+				"version",
+				"instanceId",
+				"sessionId",
+				"sequence",
+				"complete",
+				"gaps",
+				"agents"
+			],
+			"description": "完整替换的只读快照；序号属于本进程，缺失事实不能解释为空闲。"
+		},
 		"SubagentMessages": {
 			"type": "object",
 			"properties": {
@@ -4284,6 +4415,10 @@
 				},
 				"maxReassembledFrameBytes": {
 					"type": "integer"
+				},
+				"runtimeActivityVersion": {
+					"type": "integer",
+					"description": "真实身份和活动的只读快照版本。"
 				}
 			},
 			"required": [

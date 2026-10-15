@@ -2,6 +2,8 @@ import { afterEach, beforeEach, expect, test, vi } from "bun:test";
 import { streamGoogleGeminiCli } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getModelActivity, withModelActivityOwner } from "@oh-my-pi/pi-ai/model-activity";
+import { transportFetch } from "@oh-my-pi/pi-ai/utils/transport-fetch";
 
 const ANTIGRAVITY_DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -98,4 +100,75 @@ test("Antigravity Flash fails over when headers arrive without a first SSE event
 	expect(dailyBodyCancelled).toBe(true);
 	expect(result.stopReason).toBe("stop");
 	expect(result.content).toEqual([{ type: "text", text: "Recovered after stall." }]);
+});
+
+test("备用地址接管前取消非空错误正文，真实响应结束后不残留活动", async () => {
+	const rootSessionId = "gemini-error-body-failover";
+	const owner = { agentId: "Main", sessionId: rootSessionId, rootSessionId };
+	const activity = () => getModelActivity().filter(record => record.rootSessionId === rootSessionId);
+	const endpoints: string[] = [];
+	let cancelled = false;
+	let responseController!: ReadableStreamDefaultController<Uint8Array>;
+	const secondStarted = Promise.withResolvers<void>();
+	const fetchMock: FetchImpl = async input => {
+		const endpoint = endpointFromInput(input);
+		endpoints.push(endpoint);
+		if (endpoint === ANTIGRAVITY_DAILY_ENDPOINT) {
+			return responseWithUrl(
+				new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(new TextEncoder().encode("服务暂不可用"));
+						},
+						cancel() {
+							cancelled = true;
+						},
+					}),
+					{ status: 503 },
+				),
+				endpoint,
+			);
+		}
+		expect(cancelled).toBe(true);
+		const response = responseWithUrl(
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						responseController = controller;
+						controller.enqueue(
+							new TextEncoder().encode(
+								`data: ${JSON.stringify({
+									response: {
+										candidates: [{ content: { parts: [{ text: "已恢复" }] }, finishReason: "STOP" }],
+									},
+								})}\n\n`,
+							),
+						);
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			),
+			endpoint,
+		);
+		secondStarted.resolve();
+		return response;
+	};
+	const stream = withModelActivityOwner(owner, () =>
+		streamGoogleGeminiCli(antigravityModel, context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			antigravityEndpointMode: "auto",
+			fetch: transportFetch(antigravityModel, fetchMock),
+		}),
+	);
+	try {
+		await secondStarted.promise;
+		expect(activity()).toEqual([expect.objectContaining({ ...owner, observable: true })]);
+	} finally {
+		responseController?.close();
+	}
+	const result = await stream.result();
+	expect(endpoints).toEqual([ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT]);
+	expect(result.stopReason).toBe("stop");
+	expect(result.content).toEqual([{ type: "text", text: "已恢复" }]);
+	expect(activity()).toEqual([]);
 });

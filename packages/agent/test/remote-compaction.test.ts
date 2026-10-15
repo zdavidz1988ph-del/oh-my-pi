@@ -26,6 +26,7 @@ import {
 import * as ai from "@oh-my-pi/pi-ai";
 import { NO_AUTH_SENTINEL } from "@oh-my-pi/pi-ai/auth-retry";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { getModelActivity, withModelActivityOwner } from "@oh-my-pi/pi-ai/model-activity";
 import { clearAwsCredentialCache } from "@oh-my-pi/pi-ai/providers/aws-credentials";
 import {
 	buildTransformedCodexRequestBody,
@@ -1181,8 +1182,13 @@ describe("requestCompactionV2Streaming", () => {
 			"instructions",
 		);
 		let attempts = 0;
+		const owner = { agentId: "Main", sessionId: "compact-retry", rootSessionId: "compact-retry" };
+		const activity = () => getModelActivity().filter(record => record.rootSessionId === owner.rootSessionId);
+		const requestIds: string[] = [];
 		const fetchMock: FetchImpl = async () => {
 			attempts++;
+			expect(activity()).toEqual([expect.objectContaining({ ...owner, observable: true })]);
+			requestIds.push(activity()[0]!.id);
 			if (attempts === 1) {
 				return new Response("try again", { status: 500, statusText: "Internal Server Error" });
 			}
@@ -1196,10 +1202,16 @@ describe("requestCompactionV2Streaming", () => {
 			]);
 		};
 
-		await requestCompactionV2Streaming(model, "test-key", request, undefined, {
-			fetch: fetchMock,
-			retryWait: async () => {},
-		});
+		await withModelActivityOwner(owner, () =>
+			requestCompactionV2Streaming(model, "test-key", request, undefined, {
+				fetch: fetchMock,
+				retryWait: async () => {
+					expect(activity()).toEqual([]);
+				},
+			}),
+		);
+		expect(activity()).toEqual([]);
+		expect(requestIds[0]).not.toBe(requestIds[1]);
 
 		expect(attempts).toBe(2);
 	});
@@ -2189,6 +2201,63 @@ describe("compact() remote compaction failure handling", () => {
 			settings: { ...DEFAULT_COMPACTION_SETTINGS, remoteStreamingV2Enabled: false },
 		};
 	}
+
+	test("完整压缩入口等待凭据时不显示模型运行，正文结束后才清空活动", async () => {
+		const owner = { agentId: "Main", sessionId: "compact-auth-tail", rootSessionId: "compact-auth-tail" };
+		const activity = () => getModelActivity().filter(record => record.rootSessionId === owner.rootSessionId);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const sent = Promise.withResolvers<void>();
+		let controller!: ReadableStreamDefaultController<Uint8Array>;
+		const model: Model<"openai-responses"> = {
+			...makeOpenAiModel({
+				id: "us.openai.gpt-6-astra",
+				provider: "bedrock-lazy-headers",
+				baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+			}),
+			resolveHeaders: async () => {
+				entered.resolve();
+				await release.promise;
+				return { Authorization: "Bearer lazy-token" };
+			},
+		};
+		const operation = withModelActivityOwner(owner, () =>
+			compact(makePreparation(), model, NO_AUTH_SENTINEL, undefined, undefined, {
+				fetch: async () => {
+					const response = new Response(
+						new ReadableStream<Uint8Array>({
+							start(value) {
+								controller = value;
+								value.enqueue(
+									new TextEncoder().encode(
+										JSON.stringify({
+											output: [{ type: "compaction", encrypted_content: "enc-activity" }],
+										}),
+									),
+								);
+							},
+						}),
+						{ headers: { "content-type": "application/json" } },
+					);
+					sent.resolve();
+					return response;
+				},
+			}),
+		);
+		try {
+			await entered.promise;
+			expect(activity()).toEqual([]);
+			release.resolve();
+			await sent.promise;
+			expect(activity()).toEqual([expect.objectContaining({ ...owner, observable: true })]);
+		} finally {
+			release.resolve();
+			controller?.close();
+		}
+		const result = await operation;
+		expect(JSON.stringify(result.preserveData)).toContain("enc-activity");
+		expect(activity()).toEqual([]);
+	});
 
 	test("V1 compact drops mixed-provider Anthropic state and keeps unrelated preserve data", async () => {
 		const compactionItem = { type: "compaction", encrypted_content: "enc-current-v1" };

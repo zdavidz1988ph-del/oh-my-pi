@@ -1,4 +1,5 @@
 import { resolveExtraCa, withExtraCaInit } from "@oh-my-pi/pi-utils";
+import { retainModelActivity, type ModelActivityLease } from "../model-activity";
 import { coworkFetch } from "../providers/cowork-fetch";
 import { withInferenceUserAgent } from "../providers/inference-headers";
 import type { Api, FetchImpl, Model } from "../types";
@@ -34,13 +35,61 @@ export function transportFetch(model: Model<Api>, fetchImpl: FetchImpl | undefin
 		const extraCa = resolveExtraCa();
 		if (extraCa) init = withExtraCaInit(init, extraCa);
 		if (proxyUrl) init = withProxyInit(input, init, proxyUrl);
-		if (!isRequestDebugEnabled()) return base(input, init);
-		const session = await createFetchRequestDebugSession(input, init);
-		return session.wrapResponse(await base(input, init));
+		const session = isRequestDebugEnabled() ? await createFetchRequestDebugSession(input, init) : undefined;
+		// 等待凭据、名额或调试文件不算发送；响应头到达也不等于传输结束。
+		const activity = retainModelActivity();
+		let response: Response;
+		try { response = await base(input, init); }
+		catch (error) { activity.finish(); throw error; }
+		try {
+			const observed = observeResponse(response, activity);
+			return session ? await session.wrapResponse(observed) : observed;
+		} catch (error) {
+			activity.unobservable();
+			throw error;
+		}
 	};
 	if (base.preconnect) fetch.preconnect = base.preconnect;
 	fetch[TRANSPORT_FETCH] = true;
 	return fetch;
+}
+
+function observeResponse(response: Response, activity: ModelActivityLease): Response {
+	if (!response.body) {
+		activity.finish();
+		return response;
+	}
+	const reader = response.body.getReader();
+	const body = new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					activity.finish();
+					controller.close();
+				} else controller.enqueue(value);
+			} catch (error) {
+				activity.finish();
+				controller.error(error);
+			}
+		},
+		async cancel(reason) {
+			try {
+				await reader.cancel(reason);
+				activity.finish();
+			} catch (error) {
+				activity.unobservable();
+				throw error;
+			}
+		},
+	});
+	const wrapped = new Response(body, {
+		status: response.status, statusText: response.statusText, headers: response.headers,
+	});
+	for (const key of ["url", "redirected", "type"] as const) {
+		Object.defineProperty(wrapped, key, { value: response[key], configurable: true });
+	}
+	return wrapped;
 }
 
 /** Options-bag form of {@link transportFetch}; returns `options` untouched when its fetch is already built. */

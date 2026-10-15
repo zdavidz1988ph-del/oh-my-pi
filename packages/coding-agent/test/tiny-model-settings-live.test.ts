@@ -10,11 +10,12 @@ class ReplyingWorker {
 	terminated = false;
 	#handlers = new Set<(message: TinyWorkerResponse) => void>();
 
-	send(message: TinyWorkerRequest): void {
-		if (message.type !== "chat") return;
+	send(message: TinyWorkerRequest): boolean {
+		if (message.type !== "chat") return true;
 		queueMicrotask(() => {
 			for (const handler of this.#handlers) handler({ type: "text", id: message.id, text: "reply" });
 		});
+		return true;
 	}
 
 	onMessage(handler: (message: TinyWorkerResponse) => void): () => void {

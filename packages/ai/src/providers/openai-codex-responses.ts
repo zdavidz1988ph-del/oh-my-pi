@@ -23,6 +23,16 @@ import {
 	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import {
+	captureModelActivityOwner,
+	captureModelActivityStarter,
+	captureModelTransportObservation,
+	observeModelTransportStream,
+	retainModelActivity,
+	withModelActivityOwner,
+	type ModelActivityLease,
+	type ModelActivityOwner,
+} from "../model-activity";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
 import { isOfficialCodexApiUrl } from "../stream";
@@ -91,6 +101,7 @@ import {
 	type CodexAcceptedSteer,
 	type CodexSteerAck,
 	CodexSteerPump,
+	isCodexToolOutput,
 	planSteeredRequest,
 	toSteerInputItems,
 } from "./openai-codex/live-steering";
@@ -3885,6 +3896,7 @@ type CodexWebSocketExchange =
 
 interface CodexSteerWaiter {
 	previousResponseId: string;
+	activityOwner?: ModelActivityOwner;
 	resolve: (ack: CodexSteerAck) => void;
 	reject: (error: Error) => void;
 }
@@ -3892,6 +3904,21 @@ interface CodexSteerWaiter {
 interface CodexWebSocketConnectionOptions {
 	onHandshakeHeaders?: (headers: Headers) => void;
 	proxy?: string;
+}
+
+interface CodexTransportActivity {
+	lease: ModelActivityLease;
+	owner: ModelActivityOwner | undefined;
+	responseId?: string;
+	sequence?: number;
+}
+
+interface CodexPendingActivity {
+	previousResponseId: string;
+	owner: ModelActivityOwner | undefined;
+	ids: Set<string>;
+	start: () => ModelActivityLease;
+	settle: () => void;
 }
 
 class CodexWebSocketConnection {
@@ -3932,6 +3959,10 @@ class CodexWebSocketConnection {
 	#failedSteers = new Set<string>();
 	/** Steering whose automatic successor the active attach request is reading. */
 	#attachSteerIds?: ReadonlySet<string>;
+	// 连接收到的事实独立于消费迭代器，自动续答在附接前也必须记账。
+	#transportActivity?: CodexTransportActivity;
+	#pendingActivity?: CodexPendingActivity;
+	#completedActivityResponses = new Set<string>();
 
 	constructor(url: string, headers: Record<string, string>, options: CodexWebSocketConnectionOptions) {
 		this.#url = url;
@@ -3983,6 +4014,7 @@ class CodexWebSocketConnection {
 
 	close(reason = "done"): void {
 		const socket = this.#socket;
+		this.#loseTransportActivity();
 		this.#socket = null;
 		this.#stopHeartbeat();
 		this.#rejectSteerWaiters(`websocket closed (${reason})`);
@@ -4013,6 +4045,7 @@ class CodexWebSocketConnection {
 		);
 		socket.binaryType = "nodebuffer";
 		this.#socket = socket;
+		this.#completedActivityResponses.clear();
 		let settled = false;
 		let timeout: NodeJS.Timeout | undefined;
 		const clearPending = () => {
@@ -4059,6 +4092,7 @@ class CodexWebSocketConnection {
 			}
 		};
 		socket.onerror = event => {
+			if (this.#socket !== null && this.#socket !== socket) return;
 			const eventRecord = event as unknown as Record<string, unknown>;
 			const detail =
 				(typeof eventRecord.message === "string" && eventRecord.message) ||
@@ -4071,9 +4105,12 @@ class CodexWebSocketConnection {
 				reject(error);
 				return;
 			}
+			if (this.#socket === socket) this.#loseTransportActivity();
 			this.#push(error);
 		};
 		socket.onclose = event => {
+			if (this.#socket !== null && this.#socket !== socket) return;
+			if (this.#socket === socket) this.#loseTransportActivity();
 			this.#socket = null;
 			this.#stopHeartbeat();
 			this.#rejectSteerWaiters(`websocket closed (${event.code})`);
@@ -4087,6 +4124,7 @@ class CodexWebSocketConnection {
 			this.#push(null);
 		};
 		socket.onmessage = event => {
+			if (this.#socket !== socket) return;
 			// Stamp inbound activity before parsing so even malformed frames refresh
 			// the liveness clock — what matters for reuse health is that the upstream
 			// is still talking to us, not that every frame is well-formed.
@@ -4112,13 +4150,20 @@ class CodexWebSocketConnection {
 					this.#handleSteerEvent(parsed);
 					return;
 				}
+				const responseId = extractCodexFrameResponseId(parsed);
+				// 入队前统一丢弃旧回复，记账和消费方都不能把它当成新请求。
+				if (responseId !== undefined && this.#completedActivityResponses.has(responseId)) return;
 				// The native lane answers `response.steer` with a plain `error` that
 				// also ends the response: refuse the submission, then fail the stream.
 				if (parsed.type === "error" && parsed.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE) {
 					this.#refuseSteerWaiters(parsed.code, typeof parsed.message === "string" ? parsed.message : undefined);
 				}
+				this.#observeTransportFrame(parsed);
 				this.#push(parsed);
+				// 不淘汰旧编号后继续复用；历史达到上限时关闭这条连接。
+				if (this.#completedActivityResponses.size >= 256) this.close("response-history-limit");
 			} catch (error) {
+				this.#loseTransportActivity();
 				notifyCodexWebSocketMalformed(this.#streamObserver, event.data, error);
 				this.#push(new CodexWebSocketTransportError(`${String(error)}`));
 			}
@@ -4172,6 +4217,9 @@ class CodexWebSocketConnection {
 			this.close("aborted");
 		};
 		if (signal) signal.addEventListener("abort", onAbort, { once: true });
+		let terminal = false;
+		const observed = captureModelTransportObservation();
+		if ("attachSteerIds" in exchange && this.#transportActivity) observed();
 
 		try {
 			if ("send" in exchange) {
@@ -4203,9 +4251,30 @@ class CodexWebSocketConnection {
 					}
 					throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 				}
+				const pending = this.#pendingActivity;
+				const resumesPending =
+					!this.#transportActivity &&
+					pending &&
+					request.previous_response_id === pending.previousResponseId &&
+					Array.isArray(request.input) &&
+					request.input.some(isCodexToolOutput);
+				if (!resumesPending) this.#loseTransportActivity();
+				const activity: CodexTransportActivity = {
+					lease: retainModelActivity(),
+					owner: captureModelActivityOwner(),
+				};
+				this.#transportActivity = activity;
 				try {
 					socket.send(requestPayload);
+					// 只有实际送出工具结果后才接续旧等待；发送抛错必须保留未知事实。
+					if (resumesPending && this.#pendingActivity === pending) {
+						pending.settle();
+						this.#pendingActivity = undefined;
+					}
 				} catch (error) {
+					activity.lease.finish();
+					if (this.#transportActivity === activity) this.#transportActivity = undefined;
+					if (resumesPending) this.#losePendingActivity();
 					throw new CodexWebSocketTransportError(
 						`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
 					);
@@ -4309,6 +4378,7 @@ class CodexWebSocketConnection {
 					}
 					lastSequence = frameSequence;
 				}
+				if (this.#transportActivity || frameResponseId !== undefined) observed();
 				sawFirstEvent = true;
 				lastEventAt = Date.now();
 				lastEventType = eventType || undefined;
@@ -4316,14 +4386,15 @@ class CodexWebSocketConnection {
 					lastProgressAt = lastEventAt;
 					lastProgressEventType = lastEventType;
 				}
-				yield next;
-				if (
+				terminal =
 					eventType === "response.completed" ||
 					eventType === "response.done" ||
 					eventType === "response.incomplete" ||
 					eventType === "response.failed" ||
-					eventType === "error"
-				) {
+					eventType === "error";
+				// 消费方可能在这一帧直接结束迭代，必须先保存真正的结束证据。
+				yield next;
+				if (terminal) {
 					break;
 				}
 			}
@@ -4352,7 +4423,13 @@ class CodexWebSocketConnection {
 		const event = { type: "response.steer", previous_response_id: previousResponseId, input };
 		const payload = JSON.stringify(event);
 		const { promise, resolve, reject } = Promise.withResolvers<CodexSteerAck>();
-		const waiter: CodexSteerWaiter = { previousResponseId, resolve, reject };
+		const waiter: CodexSteerWaiter = {
+			previousResponseId,
+			resolve,
+			reject,
+			activityOwner:
+				this.#transportActivity?.responseId === previousResponseId ? this.#transportActivity.owner : undefined,
+		};
 		this.#steerWaiters.push(waiter);
 		notifyCodexWebSocketOutbound(this.#streamObserver, event, payload);
 		try {
@@ -4378,9 +4455,11 @@ class CodexWebSocketConnection {
 		const id = typeof steer?.id === "string" ? steer.id : undefined;
 		const previousResponseId = typeof steer?.previous_response_id === "string" ? steer.previous_response_id : "";
 		if (event.type === "response.steer.accepted") {
-			if (!id) return;
+			if (!id || this.#acceptedSteers.has(id)) return;
 			this.#acceptedSteers.add(id);
-			this.#takeSteerWaiter(previousResponseId)?.resolve({ accepted: true, id });
+			const waiter = this.#takeSteerWaiter(previousResponseId);
+			this.#queueContinuationActivity(previousResponseId, id, waiter?.activityOwner);
+			waiter?.resolve({ accepted: true, id });
 			return;
 		}
 		if (event.type === "response.steer.failed") {
@@ -4390,6 +4469,11 @@ class CodexWebSocketConnection {
 			if (id && this.#acceptedSteers.has(id)) {
 				// Accepted input that never reached a successor response.
 				this.#failedSteers.add(id);
+				const pending = this.#pendingActivity;
+				if (pending?.ids.delete(id) && pending.ids.size === 0) {
+					pending.settle();
+					this.#pendingActivity = undefined;
+				}
 				if (this.#attachSteerIds?.has(id)) {
 					this.#push(
 						new CodexSteerCommitError(`steering ${id} was not committed: ${code ?? message ?? "unknown"}`),
@@ -4421,6 +4505,81 @@ class CodexWebSocketConnection {
 		if (waiters.length === 0) return;
 		this.#steerWaiters = [];
 		for (const waiter of waiters) waiter.reject(new CodexWebSocketTransportError(reason));
+	}
+
+	#queueContinuationActivity(previousResponseId: string, id: string, owner: ModelActivityOwner | undefined): void {
+		if (this.#pendingActivity && this.#pendingActivity.previousResponseId !== previousResponseId) {
+			this.#losePendingActivity();
+		}
+		if (!this.#pendingActivity) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			let start!: () => ModelActivityLease;
+			withModelActivityOwner(owner, () =>
+				observeModelTransportStream(() => {
+					start = captureModelActivityStarter();
+					return { result: () => promise };
+				}),
+			);
+			this.#pendingActivity = { previousResponseId, owner, ids: new Set(), start, settle: resolve };
+		}
+		const pending = this.#pendingActivity;
+		// 协议失控时只保留身份缺口，不能无限积攒确认编号。
+		if (pending.ids.size >= 256 && !pending.ids.has(id)) this.#losePendingActivity();
+		else pending.ids.add(id);
+	}
+
+	#losePendingActivity(): void {
+		const pending = this.#pendingActivity;
+		if (!pending) return;
+		pending.start().unobservable();
+		pending.settle();
+		this.#pendingActivity = undefined;
+	}
+
+	#loseTransportActivity(): void {
+		this.#transportActivity?.lease.unobservable();
+		this.#transportActivity = undefined;
+		this.#losePendingActivity();
+	}
+
+	#observeTransportFrame(frame: Record<string, unknown>): void {
+		const responseId = extractCodexFrameResponseId(frame);
+		const sequence = extractCodexFrameSequenceNumber(frame);
+		let activity = this.#transportActivity;
+		const pending = this.#pendingActivity;
+		// 接受插话不等于模型已开工；收到续答事实后才发放运行编号。
+		if (!activity && pending && responseId !== undefined && responseId !== pending.previousResponseId) {
+			activity = { lease: pending.start(), owner: pending.owner, responseId };
+			this.#transportActivity = activity;
+			pending.settle();
+			this.#pendingActivity = undefined;
+		}
+		if (!activity) return;
+		if (responseId !== undefined) {
+			if (activity.responseId !== undefined && activity.responseId !== responseId) {
+				this.#loseTransportActivity();
+				return;
+			}
+			activity.responseId = responseId;
+		}
+		if (sequence !== undefined) {
+			if (activity.sequence !== undefined && sequence < activity.sequence) {
+				this.#loseTransportActivity();
+				return;
+			}
+			activity.sequence = sequence;
+		}
+		if (
+			frame.type === "response.completed" ||
+			frame.type === "response.done" ||
+			frame.type === "response.incomplete" ||
+			frame.type === "response.failed" ||
+			frame.type === "error"
+		) {
+			activity.lease.finish();
+			if (activity.responseId !== undefined) this.#completedActivityResponses.add(activity.responseId);
+			this.#transportActivity = undefined;
+		}
 	}
 
 	#captureHandshakeHeaders(socket: Bun.WebSocket, openEvent?: Event): void {

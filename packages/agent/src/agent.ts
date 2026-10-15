@@ -109,6 +109,8 @@ export class AgentBusyError extends Error {
 }
 export interface AgentOptions {
 	initialState?: Partial<AgentState>;
+	/** 由会话绑定真实模型活动归属；普通工具内的模型调用继承同一异步作用域。 */
+	runInModelActivityScope?: <T>(action: () => T) => T;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -472,6 +474,7 @@ export class Agent {
 	#cursorOnToolResult?: CursorToolResultHandler;
 	#cwd?: string;
 	#cwdResolver?: () => string | undefined;
+	#runInModelActivityScope?: AgentOptions["runInModelActivityScope"];
 
 	#runningPrompt?: Promise<void>;
 	#resolveRunningPrompt?: () => void;
@@ -583,6 +586,7 @@ export class Agent {
 		this.#cursorOnToolResult = opts.cursorOnToolResult;
 		this.#cwd = opts.cwd;
 		this.#cwdResolver = opts.cwdResolver;
+		this.#runInModelActivityScope = opts.runInModelActivityScope;
 		this.#kimiApiFormat = opts.kimiApiFormat;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
@@ -1716,7 +1720,21 @@ export class Agent {
 	 * If messages are provided, starts a new conversation turn with those messages.
 	 * Otherwise, continues from existing context.
 	 */
-	async #runLoop(
+	#runLoop(
+		messages?: AgentMessage[],
+		options?: AgentPromptOptions & { skipInitialSteeringPoll?: boolean },
+		continuationSignal?: AbortSignal,
+		runStateClaimed = false,
+	) {
+		if (this.#runInModelActivityScope) {
+			return this.#runInModelActivityScope(() =>
+				this.#runScopedLoop(messages, options, continuationSignal, runStateClaimed),
+			);
+		}
+		return this.#runScopedLoop(messages, options, continuationSignal, runStateClaimed);
+	}
+
+	async #runScopedLoop(
 		messages?: AgentMessage[],
 		options?: AgentPromptOptions & { skipInitialSteeringPoll?: boolean },
 		continuationSignal?: AbortSignal,

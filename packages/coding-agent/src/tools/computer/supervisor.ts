@@ -1,4 +1,5 @@
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { captureModelActivityOwner, type ModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
 import { withTimeout } from "@oh-my-pi/pi-utils/async";
@@ -63,7 +64,12 @@ const DEFAULT_TIMEOUTS: ComputerSupervisorTimeouts = {
 export type ComputerSessionToolCaller = (
 	name: string,
 	args: unknown,
-	options: { session: ToolSession; signal?: AbortSignal; emitStatus?: () => void },
+	options: {
+		session: ToolSession;
+		signal?: AbortSignal;
+		emitStatus?: () => void;
+		modelActivityOwner?: ModelActivityOwner;
+	},
 ) => Promise<unknown>;
 
 /** Creates an isolated computer worker handle. */
@@ -73,6 +79,7 @@ interface PendingRun {
 	resolve(value: ComputerRunOk): void;
 	reject(error: unknown): void;
 	signal?: AbortSignal;
+	modelActivityOwner?: ModelActivityOwner;
 	toolCalls: Map<string, AbortController>;
 	context?: AgentToolContext;
 }
@@ -199,13 +206,14 @@ export class ComputerSupervisor implements ComputerController {
 	): Promise<ComputerRunOk> {
 		if (this.#closed) throw new ToolError("Computer session is closed");
 		if (signal?.aborted) throw new ToolAbortError();
+		const modelActivityOwner = captureModelActivityOwner();
 		const epoch = this.#controlEpoch;
 		await this.#start();
 		if (signal?.aborted || epoch !== this.#controlEpoch) throw new ToolAbortError();
 
 		const id = `computer-${++this.#nextId}`;
 		const { promise, resolve, reject } = Promise.withResolvers<ComputerRunOk>();
-		const pending: PendingRun = { resolve, reject, signal, context, toolCalls: new Map() };
+		const pending: PendingRun = { resolve, reject, signal, context, toolCalls: new Map(), modelActivityOwner };
 		this.#pending.set(id, pending);
 		const abort = (): void => {
 			this.#safeSend({ type: "abort", id });
@@ -364,6 +372,7 @@ export class ComputerSupervisor implements ComputerController {
 		try {
 			const value = await this.#callSessionTool(message.name, message.args, {
 				session: this.#session,
+				modelActivityOwner: pending.modelActivityOwner,
 				signal: controller.signal,
 				emitStatus: () => {},
 			});

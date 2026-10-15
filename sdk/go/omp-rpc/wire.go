@@ -3169,6 +3169,97 @@ func (v *SubagentSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type AgentActivity struct {
+	ID                 string            `json:"id"`
+	SessionID          *string           `json:"sessionId"`
+	ParentID           *string           `json:"parentId"`
+	Name               string            `json:"name"`
+	Kind               AgentActivityKind `json:"kind"`
+	Status             string            `json:"status"`
+	ModelRequestIds    []string          `json:"modelRequestIds"`
+	ToolCallIds        []string          `json:"toolCallIds"`
+	PendingQuestionIds []string          `json:"pendingQuestionIds"`
+	WaitingForResult   bool              `json:"waitingForResult"`
+	Complete           bool              `json:"complete"`
+}
+
+func (v *AgentActivity) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AgentActivity", v.decodeFrom)
+}
+
+func (v *AgentActivity) decodeFrom(raw map[string]json.RawMessage) error {
+	var out AgentActivity
+	d := fieldDecoder{raw: raw, owner: "AgentActivity"}
+	d.required("id", &out.ID)
+	d.nullable("sessionId", &out.SessionID)
+	d.nullable("parentId", &out.ParentID)
+	d.required("name", &out.Name)
+	d.required("kind", &out.Kind)
+	d.required("status", &out.Status)
+	d.required("modelRequestIds", &out.ModelRequestIds)
+	d.required("toolCallIds", &out.ToolCallIds)
+	d.required("pendingQuestionIds", &out.PendingQuestionIds)
+	d.required("waitingForResult", &out.WaitingForResult)
+	d.required("complete", &out.Complete)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type AgentActivityKind string
+
+const (
+	AgentActivityKindMain AgentActivityKind = "main"
+	AgentActivityKindSub  AgentActivityKind = "sub"
+)
+
+func (v *AgentActivityKind) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "AgentActivityKind")
+	if err != nil {
+		return err
+	}
+	switch value := AgentActivityKind(s); value {
+	case AgentActivityKindMain, AgentActivityKindSub:
+		*v = value
+		return nil
+	}
+	return unknownValue("AgentActivityKind", s)
+}
+
+// 完整替换的只读快照；序号属于本进程，缺失事实不能解释为空闲。
+type RuntimeActivity struct {
+	Version    int64           `json:"version"`
+	InstanceID string          `json:"instanceId"`
+	SessionID  string          `json:"sessionId"`
+	Sequence   int64           `json:"sequence"`
+	Complete   bool            `json:"complete"`
+	Gaps       []string        `json:"gaps"`
+	Agents     []AgentActivity `json:"agents"`
+}
+
+func (v *RuntimeActivity) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "RuntimeActivity", v.decodeFrom)
+}
+
+func (v *RuntimeActivity) decodeFrom(raw map[string]json.RawMessage) error {
+	var out RuntimeActivity
+	d := fieldDecoder{raw: raw, owner: "RuntimeActivity"}
+	d.required("version", &out.Version)
+	d.required("instanceId", &out.InstanceID)
+	d.required("sessionId", &out.SessionID)
+	d.required("sequence", &out.Sequence)
+	d.required("complete", &out.Complete)
+	d.required("gaps", &out.Gaps)
+	d.required("agents", &out.Agents)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 // Incremental subagent transcript read.
 type SubagentMessages struct {
 	SessionFile string `json:"sessionFile"`
@@ -4536,6 +4627,8 @@ type ReadyEvent struct {
 	SupportedProtocolVersions []int64 `json:"supportedProtocolVersions,omitempty"`
 	MaxFrameBytes             *int64  `json:"maxFrameBytes,omitempty"`
 	MaxReassembledFrameBytes  *int64  `json:"maxReassembledFrameBytes,omitempty"`
+	// 真实身份和活动的只读快照版本。
+	RuntimeActivityVersion *int64 `json:"runtimeActivityVersion,omitempty"`
 }
 
 func (v *ReadyEvent) UnmarshalJSON(data []byte) error {
@@ -4550,6 +4643,7 @@ func (v *ReadyEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("supportedProtocolVersions", &out.SupportedProtocolVersions)
 	d.optional("maxFrameBytes", &out.MaxFrameBytes)
 	d.optional("maxReassembledFrameBytes", &out.MaxReassembledFrameBytes)
+	d.optional("runtimeActivityVersion", &out.RuntimeActivityVersion)
 	if d.err != nil {
 		return d.err
 	}
@@ -7607,6 +7701,13 @@ func (c Commands) GetSubagents(ctx context.Context) ([]SubagentSnapshot, error) 
 	var out GetSubagentsResult
 	err := c.call(ctx, "get_subagents", nil, 0, &out)
 	return out.Subagents, err
+}
+
+// GetRuntimeActivity sends "get_runtime_activity": 读取当前根会话及其原生子代理的完整活动事实，不包含消息或工具参数。
+func (c Commands) GetRuntimeActivity(ctx context.Context) (RuntimeActivity, error) {
+	var out RuntimeActivity
+	err := c.call(ctx, "get_runtime_activity", nil, 0, &out)
+	return out, err
 }
 
 // GetSubagentMessagesCommand holds the parameters of "get_subagent_messages".

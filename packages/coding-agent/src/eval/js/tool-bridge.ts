@@ -1,5 +1,5 @@
 import { type AgentTool, type AgentToolResult, validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
-import { type ImageContent, toolWireSchema } from "@oh-my-pi/pi-ai";
+import { type ImageContent, type ModelActivityOwner, toolWireSchema, withModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ToolSession } from "../../tools";
@@ -36,6 +36,8 @@ export type { JsStatusEvent } from "./shared/types";
 
 export interface ToolBridgeOptions {
 	session: ToolSession;
+	/** 由发起单元捕获，不在工作器回包时读取新会话身份。 */
+	modelActivityOwner?: ModelActivityOwner;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
@@ -198,7 +200,11 @@ function waitForSpeculativeClaim<T>(claim: Promise<T>, signal?: AbortSignal): Pr
 	return promise;
 }
 
-export async function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
+export function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
+	return withModelActivityOwner(options.modelActivityOwner, () => callSessionToolScoped(name, args, options));
+}
+
+async function callSessionToolScoped(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
 	if (name === "__prelude__") {
 		const request = parsePreludeRequest(args);
 		const toolCallId = `prelude-${request.name}-${crypto.randomUUID()}`;

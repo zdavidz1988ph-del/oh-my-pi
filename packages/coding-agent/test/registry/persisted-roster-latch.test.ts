@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
+import { ensurePersistedRoster, isPersistedRosterReady } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
@@ -487,4 +487,160 @@ describe("persisted roster latch semantics", () => {
 		expect(registry.get("Worker")?.sessionFile).toBe(childA);
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(3);
 	}, 10_000);
+	it("已取消的同名身份阻挡新根时保留缺口，释放冲突后才恢复完整", async () => {
+		using tempDir = TempDir.createSync("@omp-roster-conflict-");
+		const rootA = path.join(tempDir.path(), "a", "main.jsonl");
+		const rootB = path.join(tempDir.path(), "b", "main.jsonl");
+		const childA = path.join(scanDir(rootA), "Worker.jsonl");
+		const childB = path.join(scanDir(rootB), "Worker.jsonl");
+		await Bun.write(rootA, `${sessionHeader("root-a")}\n`);
+		await Bun.write(rootB, `${sessionHeader("root-b")}\n`);
+		await Bun.write(childA, `${sessionHeader("child-a")}\n${sessionInitRecord()}\n`);
+		await Bun.write(`${childA}.tombstone`, "");
+		await Bun.write(childB, `${sessionHeader("child-b")}\n${sessionInitRecord()}\n`);
+		const registry = new AgentRegistry();
+		const readdirs: string[] = [];
+		spyOnReaddirs(readdirs);
+		await ensurePersistedRoster(registry, rootA);
+		const cancelled = registry.get("Worker")!;
+		expect(cancelled.status).toBe("aborted");
+		expect(isPersistedRosterReady(registry, rootA)).toBe(true);
+		for (let i = 0; i < 3; i++) await ensurePersistedRoster(registry, rootB);
+		expect(registry.get("Worker")).toBe(cancelled);
+		expect(isPersistedRosterReady(registry, rootB)).toBe(false);
+		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(1);
+		expect(registry.unregister("Worker", cancelled)).toBe(true);
+		await ensurePersistedRoster(registry, rootB);
+		expect(registry.get("Worker")).toMatchObject({ status: "parked", rootSessionId: "root-b", sessionId: "child-b" });
+		expect(isPersistedRosterReady(registry, rootB)).toBe(true);
+		expect(isPersistedRosterReady(registry, rootA)).toBe(false);
+		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
+		await ensurePersistedRoster(registry, rootA);
+		expect(registry.get("Worker")).toMatchObject({
+			status: "aborted",
+			rootSessionId: "root-a",
+			sessionId: "child-a",
+		});
+		expect(isPersistedRosterReady(registry, rootA)).toBe(true);
+	});
+
+	it("运行中的阻挡身份不被抢占，停放后重新扫描而不是永久卡住", async () => {
+		using tempDir = TempDir.createSync("@omp-roster-running-conflict-");
+		const rootA = path.join(tempDir.path(), "a", "main.jsonl");
+		const rootB = path.join(tempDir.path(), "b", "main.jsonl");
+		await Bun.write(rootA, `${sessionHeader("root-a")}\n`);
+		await Bun.write(rootB, `${sessionHeader("root-b")}\n`);
+		await Bun.write(
+			path.join(scanDir(rootA), "Worker.jsonl"),
+			`${sessionHeader("child-a")}\n${sessionInitRecord()}\n`,
+		);
+		await Bun.write(
+			path.join(scanDir(rootB), "Worker.jsonl"),
+			`${sessionHeader("child-b")}\n${sessionInitRecord()}\n`,
+		);
+		const registry = new AgentRegistry();
+		await ensurePersistedRoster(registry, rootA);
+		const running = registry.get("Worker")!;
+		running.status = "running";
+		await ensurePersistedRoster(registry, rootB);
+		expect(registry.get("Worker")).toBe(running);
+		expect(isPersistedRosterReady(registry, rootB)).toBe(false);
+		running.status = "parked";
+		await ensurePersistedRoster(registry, rootB);
+		expect(registry.get("Worker")).toMatchObject({ rootSessionId: "root-b", sessionId: "child-b", status: "parked" });
+		expect(isPersistedRosterReady(registry, rootB)).toBe(true);
+	});
+
+	for (const mismatch of ["missing", "missing-directory", "missing-file", "rootSessionId", "sessionId"] as const) {
+		it(`Vibe 名册缺口不被当成恢复完成：${mismatch}`, async () => {
+			using tempDir = TempDir.createSync("@omp-vibe-roster-gap-");
+			const rootFile = path.join(tempDir.path(), "main.jsonl");
+			const childFile = path.join(scanDir(rootFile), "Worker.jsonl");
+			const spawn = JSON.stringify({
+				type: "custom",
+				id: "vibe-spawn",
+				parentId: null,
+				timestamp: "2026-08-25T10:00:02.000Z",
+				customType: "vibe-session-lifecycle",
+				data: {
+					version: 1,
+					action: "spawn",
+					id: "Worker",
+					ownerId: "Main",
+					parentSessionId: "root",
+					cli: "fast",
+					agent: "task",
+					childSessionFile: "Worker.jsonl",
+					createdAt: 1,
+				},
+			});
+			await Bun.write(rootFile, `${sessionHeader("root")}\n${spawn}\n`);
+			const missingLog = mismatch === "missing-directory" || mismatch === "missing-file";
+			if (!missingLog) await Bun.write(childFile, `${sessionHeader("child")}\n${sessionInitRecord()}\n`);
+			else if (mismatch === "missing-file") await fsp.mkdir(scanDir(rootFile), { recursive: true });
+			const registry = new AgentRegistry();
+			const register = () =>
+				registry.register({
+					id: "Worker",
+					displayName: "Worker",
+					kind: "sub",
+					parentId: "Main",
+					rootSessionId: "root",
+					sessionId: "child",
+					session: null,
+					sessionFile: childFile,
+					status: "parked",
+				});
+			if (mismatch === "rootSessionId" || mismatch === "sessionId") {
+				register();
+				registry.get("Worker")![mismatch] = "wrong";
+			}
+			const original = registry.get("Worker");
+			const readdirs: string[] = [];
+			spyOnReaddirs(readdirs);
+			for (let i = 0; i < 3; i++) await ensurePersistedRoster(registry, rootFile);
+			expect(registry.get("Worker")).toBe(original);
+			expect(isPersistedRosterReady(registry, rootFile)).toBe(false);
+			expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(1);
+			if (missingLog) await Bun.write(childFile, `${sessionHeader("child")}\n${sessionInitRecord()}\n`);
+			if (mismatch === "missing" || mismatch === "missing-directory" || mismatch === "missing-file") register();
+			else registry.get("Worker")![mismatch] = mismatch === "rootSessionId" ? "root" : "child";
+			await ensurePersistedRoster(registry, rootFile);
+			expect(isPersistedRosterReady(registry, rootFile)).toBe(true);
+			expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(2);
+			const restored = registry.get("Worker")!;
+			restored.sessionId = "changed";
+			expect(isPersistedRosterReady(registry, rootFile)).toBe(false);
+			await ensurePersistedRoster(registry, rootFile);
+			expect(isPersistedRosterReady(registry, rootFile)).toBe(false);
+			expect(restored.sessionId).toBe("changed");
+			restored.sessionId = "child";
+			await ensurePersistedRoster(registry, rootFile);
+			expect(isPersistedRosterReady(registry, rootFile)).toBe(true);
+		});
+	}
+
+	it("创建中的空壳和不存在的子目录不误报正式身份冲突", async () => {
+		using tempDir = TempDir.createSync("@omp-roster-stub-conflict-");
+		const rootA = path.join(tempDir.path(), "a", "main.jsonl");
+		const rootB = path.join(tempDir.path(), "b", "main.jsonl");
+		const emptyRoot = path.join(tempDir.path(), "empty.jsonl");
+		await Bun.write(rootA, `${sessionHeader("root-a")}\n`);
+		await Bun.write(rootB, `${sessionHeader("root-b")}\n`);
+		await Bun.write(emptyRoot, `${sessionHeader("empty")}\n`);
+		await Bun.write(
+			path.join(scanDir(rootA), "Worker.jsonl"),
+			`${sessionHeader("child-a")}\n${sessionInitRecord()}\n`,
+		);
+		await Bun.write(path.join(scanDir(rootB), "Worker.jsonl"), `${sessionHeader("child-b")}\n`);
+		const registry = new AgentRegistry();
+		await ensurePersistedRoster(registry, rootA);
+		const existing = registry.get("Worker")!;
+		existing.status = "aborted";
+		await ensurePersistedRoster(registry, rootB);
+		expect(isPersistedRosterReady(registry, rootB)).toBe(true);
+		expect(registry.get("Worker")).toBe(existing);
+		await ensurePersistedRoster(registry, emptyRoot);
+		expect(isPersistedRosterReady(registry, emptyRoot)).toBe(true);
+	});
 });

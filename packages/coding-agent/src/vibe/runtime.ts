@@ -24,6 +24,7 @@ import {
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { captureModelActivityOwner } from "@oh-my-pi/pi-ai";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { validateAgentAccountPools } from "../config/account-pools";
@@ -34,6 +35,7 @@ import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -96,6 +98,7 @@ export interface VibeOwnerScope {
 
 export interface VibeParentSession {
 	getAgentId?: () => string | null;
+	getRootSessionId?: () => string | undefined;
 	getSessionId?: () => string | null;
 	getSessionFile: () => string | null;
 	sessionManager?: ToolSession["sessionManager"] &
@@ -591,7 +594,7 @@ export class VibeSessionRegistry {
 		parentSessionFile: string,
 		spawn: VibeSpawnLifecycleEvent,
 		options?: { requireAgentMatch?: boolean },
-	): Promise<string | undefined> {
+	): Promise<{ childSessionFile: string; sessionId?: string } | undefined> {
 		if (options?.requireAgentMatch !== false && spawn.agent !== VIBE_CLI_AGENT[spawn.cli]) return undefined;
 		if (!/^[A-Za-z0-9_-]+$/.test(spawn.id) || spawn.childSessionFile !== `${spawn.id}.jsonl`) return undefined;
 		const artifactsDir = path.resolve(parentSessionFile.slice(0, -6));
@@ -602,7 +605,18 @@ export class VibeSessionRegistry {
 		}
 		try {
 			const persisted = await SessionManager.peekSessionInit(childSessionFile);
-			return persisted?.init ? childSessionFile : undefined;
+			if (!persisted?.init) return undefined;
+			let sessionId: string | undefined;
+			// 只读真实日志头；文件名是人物名，不是会话编号。
+			await visitEntriesFromFileStream(
+				childSessionFile,
+				entry => {
+					if (entry.type === "session" && typeof entry.id === "string") sessionId = entry.id;
+					return false;
+				},
+				{ maxRecords: 1 },
+			);
+			return { childSessionFile, sessionId };
 		} catch {
 			return undefined;
 		}
@@ -652,6 +666,7 @@ export class VibeSessionRegistry {
 		childSessionFile: string,
 		expected?: AgentRef | null,
 		teardownDeadline?: number,
+		identity?: Pick<AgentRef, "rootSessionId" | "sessionId">,
 	): Promise<void> {
 		const registry = AgentRegistry.global();
 		const existing = registry.get(id);
@@ -662,7 +677,20 @@ export class VibeSessionRegistry {
 		) {
 			return;
 		}
-		if (existing?.status === "aborted" && !existing.session) return;
+		if (
+			existing &&
+			identity &&
+			((existing.rootSessionId && identity.rootSessionId && existing.rootSessionId !== identity.rootSessionId) ||
+				(existing.sessionId && identity.sessionId && existing.sessionId !== identity.sessionId))
+		)
+			return;
+		const rootSessionId = existing?.rootSessionId ?? expected?.rootSessionId ?? identity?.rootSessionId;
+		const sessionId = existing?.sessionId ?? expected?.sessionId ?? identity?.sessionId;
+		if (existing?.status === "aborted" && !existing.session) {
+			existing.rootSessionId ??= rootSessionId;
+			existing.sessionId ??= sessionId;
+			return;
+		}
 		if (existing && !registry.setStatus(id, "aborted", existing)) return;
 		if (existing && teardownDeadline !== undefined) {
 			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release");
@@ -679,6 +707,8 @@ export class VibeSessionRegistry {
 			displayName: id,
 			kind: "sub",
 			parentId: ownerId,
+			rootSessionId,
+			sessionId,
 			session: null,
 			sessionFile: childSessionFile,
 			status: "aborted",
@@ -691,6 +721,9 @@ export class VibeSessionRegistry {
 		const sessionManager = session.sessionManager;
 		if (!sessionFile || !sessionManager) return 0;
 		const scope = this.ownerScope(session);
+		const rootSessionId =
+			session.getRootSessionId?.() ??
+			(scope.ownerId === MAIN_AGENT_ID ? sessionManager.getSessionId?.() : undefined);
 		const allSpawns = new Map<string, VibeSpawnLifecycleEvent>();
 		const terminalIntents = new Map<string, VibeTombstoneReason>();
 		for (const entry of sessionManager.getEntries()) {
@@ -738,9 +771,12 @@ export class VibeSessionRegistry {
 		for (const id of terminalIntents.keys()) {
 			const spawn = allSpawns.get(id);
 			if (!spawn) continue;
-			const childSessionFile = await this.#resolvePersistedChild(sessionFile, spawn, { requireAgentMatch: false });
-			if (!childSessionFile) continue;
-			await this.#markTerminalRef(id, scope.ownerId, childSessionFile);
+			const child = await this.#resolvePersistedChild(sessionFile, spawn, { requireAgentMatch: false });
+			if (!child) continue;
+			await this.#markTerminalRef(id, scope.ownerId, child.childSessionFile, undefined, undefined, {
+				rootSessionId,
+				sessionId: child.sessionId,
+			});
 			this.#records.delete(scopeKey(scope, id));
 		}
 
@@ -748,8 +784,9 @@ export class VibeSessionRegistry {
 		for (const candidate of candidates.values()) {
 			const { spawn } = candidate;
 			if (candidate.tombstoneReason || terminalIntents.has(spawn.id) || candidate.turnCount < 1) continue;
-			const childSessionFile = await this.#resolvePersistedChild(sessionFile, spawn);
-			if (!childSessionFile) continue;
+			const child = await this.#resolvePersistedChild(sessionFile, spawn);
+			if (!child) continue;
+			const { childSessionFile, sessionId } = child;
 			const key = scopeKey(scope, spawn.id);
 			if (this.#records.has(key)) continue;
 			const existing = AgentRegistry.global().get(spawn.id);
@@ -757,6 +794,8 @@ export class VibeSessionRegistry {
 				existing?.kind === "sub" &&
 				existing.parentId === scope.ownerId &&
 				existing.sessionFile === childSessionFile &&
+				(!existing.rootSessionId || !rootSessionId || existing.rootSessionId === rootSessionId) &&
+				(!existing.sessionId || !sessionId || existing.sessionId === sessionId) &&
 				(existing.status === "idle" || existing.status === "parked");
 			const blockedByCollision = Boolean(existing && !existingIsResumable);
 			const { agent, modelOverride, modelRole } = this.#resolveWorker(session, spawn.cli);
@@ -766,10 +805,16 @@ export class VibeSessionRegistry {
 					displayName: spawn.id,
 					kind: "sub",
 					parentId: scope.ownerId,
+					rootSessionId,
+					sessionId,
 					session: null,
 					sessionFile: childSessionFile,
 					status: "parked",
 				});
+			} else if (existingIsResumable) {
+				// 同路径扫描不会再补身份，在恢复入口补齐，但不能覆盖冲突身份。
+				existing.rootSessionId ??= rootSessionId;
+				existing.sessionId ??= sessionId;
 			}
 			this.#records.set(key, {
 				id: spawn.id,
@@ -1325,6 +1370,7 @@ export class VibeSessionRegistry {
 			parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 			parentTelemetry: session.getTelemetry?.(),
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
+			rootSessionId: captureModelActivityOwner()?.rootSessionId ?? session.getRootSessionId?.(),
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 			oauthAccountPools: Object.hasOwn(agentAccountPools, record.agent.name)
 				? agentAccountPools[record.agent.name]

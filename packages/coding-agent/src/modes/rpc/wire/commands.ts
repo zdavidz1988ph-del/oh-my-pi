@@ -167,6 +167,11 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		unwrap: "subagents",
 	},
 	{
+		name: "get_runtime_activity",
+		doc: "读取当前根会话及其原生子代理的完整活动事实，不包含消息或工具参数。",
+		result: "RuntimeActivity",
+	},
+	{
 		name: "get_subagent_messages",
 		doc: "Read a subagent transcript by id or registered session file (`subagentId` wins).",
 		params: { "subagentId?": "string", "sessionFile?": "string", "fromByte?": "number.integer" },

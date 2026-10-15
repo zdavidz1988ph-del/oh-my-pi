@@ -3363,6 +3363,41 @@ pub struct SubagentSnapshot {
 	pub parent_tool_call_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentActivity {
+	pub id: String,
+	#[serde(rename = "sessionId", deserialize_with = "Deserialize::deserialize")]
+	pub session_id: Option<String>,
+	#[serde(rename = "parentId", deserialize_with = "Deserialize::deserialize")]
+	pub parent_id: Option<String>,
+	pub name: String,
+	pub kind: AgentActivityKind,
+	pub status: String,
+	#[serde(rename = "modelRequestIds")]
+	pub model_request_ids: Vec<String>,
+	#[serde(rename = "toolCallIds")]
+	pub tool_call_ids: Vec<String>,
+	#[serde(rename = "pendingQuestionIds")]
+	pub pending_question_ids: Vec<String>,
+	#[serde(rename = "waitingForResult")]
+	pub waiting_for_result: bool,
+	pub complete: bool,
+}
+
+/// 完整替换的只读快照；序号属于本进程，缺失事实不能解释为空闲。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeActivity {
+	pub version: i64,
+	#[serde(rename = "instanceId")]
+	pub instance_id: String,
+	#[serde(rename = "sessionId")]
+	pub session_id: String,
+	pub sequence: i64,
+	pub complete: bool,
+	pub gaps: Vec<String>,
+	pub agents: Vec<AgentActivity>,
+}
+
 /// Incremental subagent transcript read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentMessages {
@@ -3987,6 +4022,9 @@ pub struct ReadyEvent {
 	pub max_frame_bytes: Option<i64>,
 	#[serde(rename = "maxReassembledFrameBytes", default, skip_serializing_if = "Option::is_none")]
 	pub max_reassembled_frame_bytes: Option<i64>,
+	/// 真实身份和活动的只读快照版本。
+	#[serde(rename = "runtimeActivityVersion", default, skip_serializing_if = "Option::is_none")]
+	pub runtime_activity_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -5700,6 +5738,24 @@ impl<'de> Deserialize<'de> for LitCompleted {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentActivityKind {
+	#[serde(rename = "main")]
+	Main,
+	#[serde(rename = "sub")]
+	Sub,
+}
+
+impl AgentActivityKind {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Main => "main",
+			Self::Sub => "sub",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogoutAccountType {
 	#[serde(rename = "api_key")]
 	ApiKey,
@@ -6274,6 +6330,20 @@ impl Command for GetSubagentsCommand {
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<GetSubagentsResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.subagents)
+	}
+}
+
+/// 读取当前根会话及其原生子代理的完整活动事实，不包含消息或工具参数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GetRuntimeActivityCommand {}
+
+impl Command for GetRuntimeActivityCommand {
+	const NAME: &'static str = "get_runtime_activity";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = RuntimeActivity;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<RuntimeActivity>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

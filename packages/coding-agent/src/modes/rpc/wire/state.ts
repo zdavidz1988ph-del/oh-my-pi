@@ -255,6 +255,31 @@ export const stateDefs = {
 		"progress?": doc(JSON_OBJECT, "Raw `AgentProgress` record."),
 		"parentToolCallId?": "string",
 	},
+	AgentActivity: {
+		id: "string",
+		sessionId: "string | null",
+		parentId: "string | null",
+		name: "string",
+		kind: "'main' | 'sub'",
+		status: "string",
+		modelRequestIds: "string[]",
+		toolCallIds: "string[]",
+		pendingQuestionIds: "string[]",
+		waitingForResult: "boolean",
+		complete: "boolean",
+	},
+	RuntimeActivity: doc(
+		{
+			version: "number.integer",
+			instanceId: "string",
+			sessionId: "string",
+			sequence: "number.integer",
+			complete: "boolean",
+			gaps: "string[]",
+			agents: "AgentActivity[]",
+		},
+		"完整替换的只读快照；序号属于本进程，缺失事实不能解释为空闲。",
+	),
 	SubagentMessages: doc(
 		{
 			sessionFile: "string",
