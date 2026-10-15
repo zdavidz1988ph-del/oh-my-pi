@@ -22,7 +22,7 @@ import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
-import { observeModelStream } from "./model-activity";
+import { observeModelTransportStream } from "./model-activity";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AppleFoundationModelsOptions } from "./providers/apple-foundation-models";
@@ -719,7 +719,7 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 	// provider exits are covered by one wrap. Official first-party providers are
 	// exempt (see `healLeakedThinking`); healing is otherwise idempotent.
 	const limit = resolveProviderInFlightLimit(model.provider, options);
-	if (limit === undefined) return healLeakedThinking(model, dispatch(false));
+	if (limit === undefined) return healLeakedThinking(model, observeModelTransportStream(() => dispatch(false)));
 
 	const outer = new AssistantMessageEventStream();
 	void (async () => {
@@ -754,7 +754,7 @@ function withProviderInFlightLimit<TOptions extends Pick<StreamOptions, "signal"
 			if (options?.signal?.aborted) {
 				throw options.signal.reason ?? new AIError.AbortError("Provider request aborted before dispatch");
 			}
-			const inner = healLeakedThinking(model, dispatch(true));
+			const inner = healLeakedThinking(model, observeModelTransportStream(() => dispatch(true)));
 			let terminalEvent: AssistantMessageEvent | undefined;
 			for await (const event of inner) {
 				if (event.type === "done" || event.type === "error") {
@@ -897,7 +897,7 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
-	return observeModelStream(() => streamRequest(model, context, options));
+	return streamRequest(model, context, options);
 }
 
 function streamRequest<TApi extends Api>(
@@ -1245,7 +1245,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	return observeModelStream(() => streamSimpleWithSession(model, context, options));
+	return streamSimpleWithSession(model, context, options);
 }
 
 function streamSimpleWithSession<TApi extends Api>(
@@ -1537,10 +1537,10 @@ function streamSimpleRequest<TApi extends Api>(
 		return withThinkingLoopGuard(model, requestOptions, opts =>
 			healLeakedThinking(
 				model,
-				streamGitLabDuoWorkflow(model as Model<"gitlab-duo-agent">, context, {
+				observeModelTransportStream(() => streamGitLabDuoWorkflow(model as Model<"gitlab-duo-agent">, context, {
 					...opts,
 					apiKey,
-				}),
+				})),
 			),
 		);
 	}

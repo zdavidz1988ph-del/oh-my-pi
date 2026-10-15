@@ -152,3 +152,22 @@ test("重复失联合并身份缺口，跨根超限后保持有界且不假装�
 	});
 	expect({ exit: result.exitCode, error: result.stderr.toString() }).toEqual({ exit: 0, error: "" });
 });
+
+test("长期不结束的传输达到上限后只保留有界未知，不在迟到结束时恢复完整", () => {
+	const source = new URL("../src/model-activity.ts", import.meta.url).href;
+	const result = Bun.spawnSync({
+		cmd: [process.execPath, "--eval", `
+			import assert from "node:assert/strict";
+			import { getModelActivity, retainModelActivity, withModelActivityOwner } from ${JSON.stringify(source)};
+			const owner={agentId:"Main",sessionId:"bounded",rootSessionId:"bounded"};
+			const leases=Array.from({length:4500},()=>withModelActivityOwner(owner,retainModelActivity));
+			assert.equal(getModelActivity().filter(x=>x.observable).length,4096);
+			assert.equal(getModelActivity().filter(x=>!x.observable).length,1);
+			for(const lease of leases) lease.finish();
+			assert.equal(getModelActivity().length,1);
+			assert.equal(getModelActivity()[0].observable,false);
+		`],
+		stdout: "pipe", stderr: "pipe", timeout: 10000,
+	});
+	expect({ exit: result.exitCode, error: result.stderr.toString() }).toEqual({ exit: 0, error: "" });
+});

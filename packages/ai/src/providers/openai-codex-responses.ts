@@ -23,6 +23,7 @@ import {
 	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { retainModelActivity, type ModelActivityLease } from "../model-activity";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
 import { isOfficialCodexApiUrl } from "../stream";
@@ -4172,6 +4173,8 @@ class CodexWebSocketConnection {
 			this.close("aborted");
 		};
 		if (signal) signal.addEventListener("abort", onAbort, { once: true });
+		let activity: ModelActivityLease | undefined;
+		let terminal = false;
 
 		try {
 			if ("send" in exchange) {
@@ -4204,6 +4207,7 @@ class CodexWebSocketConnection {
 					throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 				}
 				try {
+					activity = retainModelActivity();
 					socket.send(requestPayload);
 				} catch (error) {
 					throw new CodexWebSocketTransportError(
@@ -4213,6 +4217,8 @@ class CodexWebSocketConnection {
 			} else if (this.hasFailedSteer(exchange.attachSteerIds)) {
 				throw new CodexSteerCommitError("accepted steering was not committed to a successor response");
 			}
+			// 附接的是服务端已经接受的后续请求，不重复发送。
+			activity ??= retainModelActivity();
 			let sawFirstEvent = false;
 			const { idleTimeoutMs, firstEventTimeoutMs } = timeouts;
 			let lastProgressAt = Date.now();
@@ -4316,18 +4322,20 @@ class CodexWebSocketConnection {
 					lastProgressAt = lastEventAt;
 					lastProgressEventType = lastEventType;
 				}
-				yield next;
-				if (
-					eventType === "response.completed" ||
+				terminal = eventType === "response.completed" ||
 					eventType === "response.done" ||
 					eventType === "response.incomplete" ||
 					eventType === "response.failed" ||
-					eventType === "error"
-				) {
+					eventType === "error";
+				// 消费方可能在这一帧直接结束迭代，必须先保存真正的结束证据。
+				yield next;
+				if (terminal) {
 					break;
 				}
 			}
 		} finally {
+			if (terminal) activity?.finish();
+			else activity?.unobservable();
 			this.#activeRequest = false;
 			this.#streamObserver = undefined;
 			this.#attachSteerIds = undefined;

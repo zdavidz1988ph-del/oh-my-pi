@@ -20,6 +20,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $env, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { withoutModelTransportActivity } from "../model-activity";
 import type { FetchImpl } from "../types";
 import { raceWithSignal } from "../utils/abort";
 import {
@@ -107,13 +108,13 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 	const fetchImpl = opts.fetch ?? (globalThis.fetch as FetchImpl);
 	const promise = (async () => {
 		try {
-			const creds = await resolveFresh(
+			const creds = await withoutModelTransportActivity(() => resolveFresh(
 				profile,
 				region,
 				loadSharedConfig,
 				AbortSignal.timeout(SHARED_RESOLVE_TIMEOUT_MS),
 				fetchImpl,
-			);
+			));
 			cache.set(cacheKey, { creds, expiresAt: creds.expiresAt ?? Number.POSITIVE_INFINITY });
 			return creds;
 		} finally {

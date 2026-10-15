@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { gunzipSync } from "node:zlib";
 import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
-import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	type AssignModelRequest,
@@ -19,6 +19,8 @@ import {
 } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import type { DevinCompat } from "@oh-my-pi/pi-catalog/types";
+import { getModelActivity, withModelActivityOwner } from "../src/model-activity";
+import { transportFetch } from "../src/utils/transport-fetch";
 
 const AUTH_PAYLOAD = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "user-jwt" }));
 
@@ -146,6 +148,43 @@ const context: Context = {
 };
 
 describe("streamDevin router assignment", () => {
+	for (const rejectPrefixedAuth of [false, true]) {
+		it(`认证及模型分配不冒充生成，认证回退=${rejectPrefixedAuth}`, async () => {
+			const model = devinModel({ modelRouter: true });
+			const fixture = fakeDevin({
+				assignment: { assignmentJwt: "assign-jwt", modelUid: "claude-sonnet-4-5" },
+				rejectPrefixedAuth,
+			});
+			const arrived = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+			const release = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+			const fetchImpl: FetchImpl = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+				const url = String(input instanceof Request ? input.url : input);
+				const stage = url.includes("GetUserJwt") ? 0 : url.includes("AssignModel") ? 1 : 2;
+				arrived[stage]!.resolve();
+				await release[stage]!.promise;
+				return fixture.fetch(input, init);
+			}, { preconnect: fetch.preconnect });
+			const rootSessionId = `devin-auth-boundary-${rejectPrefixedAuth}`;
+			const activity = () => getModelActivity().filter(record => record.rootSessionId === rootSessionId);
+			const result = withModelActivityOwner({ agentId: "Main", sessionId: rootSessionId, rootSessionId },
+				() => streamDevin(model, context, { apiKey: "token", fetch: transportFetch(model, fetchImpl) }).result());
+			try {
+				for (let stage = 0; stage < 3; stage++) {
+					await arrived[stage]!.promise;
+					if (stage < 2) expect(activity()).toEqual([]);
+					else expect(activity()).toMatchObject([{ agentId: "Main", observable: true }]);
+					release[stage]!.resolve();
+				}
+				expect((await result).stopReason).toBe("stop");
+				expect(activity()).toEqual([]);
+				expect(fixture.recorded.authApiKeys).toHaveLength(rejectPrefixedAuth ? 2 : 1);
+			} finally {
+				for (const gate of release) gate.resolve();
+				await result;
+			}
+		});
+	}
+
 	it("assigns a concrete model before chat and forwards the assignment", async () => {
 		const { fetch: fetchImpl, recorded } = fakeDevin({
 			assignment: { assignmentJwt: "assign-jwt", modelUid: "claude-sonnet-4-5" },

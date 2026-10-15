@@ -15,6 +15,7 @@ export * from "./transcription";
 export * from "./video";
 export {
 	captureModelActivityOwner,
+	captureModelActivityStarter,
 	getModelActivity,
 	type ModelActivityLease,
 	type ModelActivityOwner,

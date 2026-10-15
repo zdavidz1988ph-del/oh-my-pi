@@ -34,16 +34,26 @@ jobs:
         run: >-
           bun test
           packages/ai/test/model-activity.test.ts
+          packages/ai/test/provider-inflight.test.ts
+          packages/ai/test/transport-activity.test.ts
+          packages/ai/test/aws-credentials.test.ts
+          packages/ai/test/bedrock-mantle-auth.test.ts
+          packages/ai/test/providers/google-auth.test.ts
+          packages/ai/test/devin-router.test.ts
+          packages/ai/test/gitlab-duo-workflow-provider.test.ts
+          packages/ai/test/gitlab-duo-cache-key.test.ts
+          packages/ai/test/openai-codex-stream.test.ts
           packages/coding-agent/test/local-inference-api.test.ts
           packages/coding-agent/test/tiny-model-settings-live.test.ts
           packages/coding-agent/test/issue-1940-repro.test.ts
           packages/coding-agent/test/sdk-tiny-client-dispose.test.ts
           packages/coding-agent/test/rpc-runtime-activity.test.ts
           packages/coding-agent/test/registry/persisted-roster-latch.test.ts
+          packages/coding-agent/test/vibe/activity-identity.test.ts
           packages/coding-agent/test/rpc-extension-ui.test.ts
           packages/coding-agent/test/rpc-session-settle.test.ts
           packages/coding-agent/test/compaction-speculation.test.ts
-          packages/coding-agent/test/rpc-wire-generated.test.ts
+          packages/coding-agent/test/rpc-wire/generated.test.ts
       - name: 用空白账号和回环答复实测编译后的程序
         shell: bash
         run: |

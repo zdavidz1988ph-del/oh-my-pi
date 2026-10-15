@@ -991,18 +991,17 @@ async function summarizeConversationWindow(
 
 	if (options?.remoteEndpoint) {
 		const endpoint = options.remoteEndpoint;
-		const remote = await observeModelOperation(() =>
-			withAuth(
-				apiKey,
-				key =>
+		const remote = await withAuth(
+			apiKey,
+			key => observeModelOperation(() =>
 					requestRemoteCompaction(
 						endpoint,
 						{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 						signal,
 						{ fetch: options.fetch, model, apiKey: key },
 					),
-				{ signal, missingKeyMessage: "Remote compaction credentials unavailable" },
 			),
+			{ signal, missingKeyMessage: "Remote compaction credentials unavailable" },
 		);
 		return remote.summary;
 	}
@@ -1204,18 +1203,17 @@ async function generateShortSummary(
 
 	if (options?.remoteEndpoint) {
 		const endpoint = options.remoteEndpoint;
-		const remote = await observeModelOperation(() =>
-			withAuth(
-				apiKey,
-				key =>
+		const remote = await withAuth(
+			apiKey,
+			key => observeModelOperation(() =>
 					requestRemoteCompaction(
 						endpoint,
 						{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, prompt: promptText, maxTokens },
 						signal,
 						{ fetch: options?.fetch, model, apiKey: key },
 					),
-				{ signal, missingKeyMessage: "Remote compaction credentials unavailable" },
 			),
+			{ signal, missingKeyMessage: "Remote compaction credentials unavailable" },
 		);
 		return remote.summary;
 	}
@@ -1804,18 +1802,17 @@ export async function compact(
 							tools,
 							reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
 						});
-				const remote = await observeModelOperation(() =>
-					withAuth(
-						apiKey,
-						key =>
+				const remote = await withAuth(
+					apiKey,
+					key => observeModelOperation(() =>
 							requestCompactionV2Streaming(model, key, request, signal, {
 								fetch: summaryOptions.fetch,
 								providerSessionState: summaryOptions.providerSessionState,
 								preferWebsockets: summaryOptions.preferWebsockets,
 								codexCompaction: summaryOptions.codexCompaction,
 							}),
-						{ signal },
 					),
+					{ signal },
 				);
 				preserveData = { ...preserveData, ...storeCompactionV2PreserveData(remote, model) };
 				usedRemoteCompaction = true;
@@ -1857,10 +1854,9 @@ export async function compact(
 		);
 		if (remoteHistory.length > 0) {
 			try {
-				const remote = await observeModelOperation(() =>
-					withAuth(
-						apiKey,
-						key =>
+				const remote = await withAuth(
+					apiKey,
+					key => observeModelOperation(() =>
 							requestOpenAiRemoteCompaction(
 								model,
 								key,
@@ -1874,8 +1870,8 @@ export async function compact(
 									codexCompaction: summaryOptions.codexCompaction,
 								},
 							),
-						{ signal },
 					),
+					{ signal },
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(preserveData, remote);
 				usedRemoteCompaction = true;

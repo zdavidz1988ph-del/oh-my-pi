@@ -347,6 +347,91 @@ describe("tiny model chat client", () => {
 		}
 	});
 
+	it("其他工作器和非终态消息不能结算正在运行的模型", async () => {
+		const requests: { request: TinyWorkerRequest; worker: FakeTinyWorker }[] = [];
+		const bothSent = Promise.withResolvers<void>();
+		const onSend = (request: TinyWorkerRequest, worker: FakeTinyWorker) => {
+			requests.push({ request, worker });
+			if (requests.length === 2) bothSent.resolve();
+		};
+		const firstWorker = new FakeTinyWorker(onSend);
+		const secondWorker = new FakeTinyWorker(onSend);
+		const client = new TinyTitleClient(async key => key === "lfm2.5-230m" ? firstWorker : secondWorker);
+		const rootSessionId = "tiny-worker-isolation";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		const start = (key: "lfm2.5-230m" | "qwen3-1.7b") => withModelActivityOwner(
+			{ agentId: key, sessionId: key, rootSessionId }, () => client.chat(key, []));
+		const first = start("lfm2.5-230m");
+		const second = start("qwen3-1.7b");
+		try {
+			await bothSent.promise;
+			const before = activity();
+			const firstRequest = requests.find(entry => entry.worker === firstWorker)!.request;
+			const secondRequest = requests.find(entry => entry.worker === secondWorker)!.request;
+			secondWorker.emit({ type: "text", id: firstRequest.id, text: "不属于这个工作器" });
+			firstWorker.emit({ type: "loaded", id: firstRequest.id });
+			expect(activity()).toEqual(before);
+			firstWorker.emit({ type: "text", id: firstRequest.id, text: "第一个结果" });
+			expect(await first).toBe("第一个结果");
+			expect(activity()).toMatchObject([{ agentId: "qwen3-1.7b", observable: true }]);
+			secondWorker.emit({ type: "text", id: secondRequest.id, text: "第二个结果" });
+			expect(await second).toBe("第二个结果");
+			expect(activity()).toEqual([]);
+		} finally {
+			await client.terminate();
+		}
+	});
+
+	it("连接排队不算模型运行，发送时仍沿用原请求身份", async () => {
+		const connection = Promise.withResolvers<FakeTinyWorker>();
+		const sent = Promise.withResolvers<TinyWorkerRequest>();
+		const worker = new FakeTinyWorker(request => sent.resolve(request));
+		const client = new TinyTitleClient(async () => connection.promise);
+		const rootSessionId = "tiny-connect-queue";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		const result = withModelActivityOwner({ agentId: "original", sessionId: "original", rootSessionId },
+			() => client.chat("lfm2.5-230m", []));
+		try {
+			expect(activity()).toEqual([]);
+			withModelActivityOwner({ agentId: "unrelated", sessionId: "unrelated", rootSessionId },
+				() => connection.resolve(worker));
+			const request = await sent.promise;
+			expect(activity()).toMatchObject([{ agentId: "original", observable: true }]);
+			worker.emit({ type: "text", id: request.id, text: "真实结果" });
+			expect(await result).toBe("真实结果");
+			expect(activity()).toEqual([]);
+		} finally {
+			connection.resolve(worker);
+			await client.terminate();
+		}
+	});
+
+	it("连续取消且工作器不回包时记账有上限，超限不能假装空闲", async () => {
+		let sent = Promise.withResolvers<TinyWorkerRequest>();
+		const worker = new FakeTinyWorker(request => sent.resolve(request));
+		const client = new TinyTitleClient(async () => worker);
+		const rootSessionId = "tiny-cancel-limit";
+		const activity = () => getModelActivity().filter(call => call.rootSessionId === rootSessionId);
+		try {
+			for (let index = 0; index < 600; index++) {
+				sent = Promise.withResolvers<TinyWorkerRequest>();
+				const controller = new AbortController();
+				const result = withModelActivityOwner({ agentId: "Main", sessionId: rootSessionId, rootSessionId },
+					() => client.chat("lfm2.5-230m", [], { signal: controller.signal }));
+				await sent.promise;
+				controller.abort();
+				expect(await result).toBeNull();
+			}
+			expect(activity().filter(call => call.observable)).toHaveLength(256);
+			expect(activity().filter(call => !call.observable)).toHaveLength(1);
+			await client.terminate();
+			expect(activity()).toMatchObject([{ agentId: "Main", observable: false }]);
+			expect(activity()).toHaveLength(1);
+		} finally {
+			await client.terminate();
+		}
+	});
+
 	it("连接建立失败且从未发送的请求不遗留模型活动", async () => {
 		const rootSessionId = "tiny-connect-failed";
 		const client = new TinyTitleClient(async () => {

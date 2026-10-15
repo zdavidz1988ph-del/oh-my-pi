@@ -1,4 +1,5 @@
 import { gunzipSync, gzipSync } from "node:zlib";
+import { withoutModelTransportActivity } from "../model-activity";
 
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import {
@@ -225,7 +226,8 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 		try {
 			const fetchImpl = options?.fetch ?? fetch;
 			const baseUrl = (model.baseUrl || DEVIN_API_URL).replace(/\/+$/, "");
-			const auth = await fetchDevinAuthMetadata(options?.apiKey, baseUrl, fetchImpl, options?.signal);
+			const auth = await withoutModelTransportActivity(() =>
+				fetchDevinAuthMetadata(options?.apiKey, baseUrl, fetchImpl, options?.signal));
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
 			const turn: DevinTurn = {
 				apiKey: auth.apiKey,
@@ -238,7 +240,8 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			// assignment JWT on the chat request that shares the cascade id.
 			let assignment: ModelAssignment | undefined;
 			if (model.compat.modelRouter) {
-				assignment = await assignDevinModel(model, turn, chatBaseUrl, fetchImpl, options?.signal);
+				assignment = await withoutModelTransportActivity(() =>
+					assignDevinModel(model, turn, chatBaseUrl, fetchImpl, options?.signal));
 				output.upstreamModel = assignment.modelUid;
 			}
 			let request = buildDevinChatRequest(model, context, options, turn, assignment);

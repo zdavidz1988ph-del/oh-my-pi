@@ -20,6 +20,8 @@ export interface ModelActivityRecord {
 interface ActivityScope {
 	owner?: ModelActivityOwner;
 	callId?: string;
+	observationId?: string;
+	suppressTransport?: boolean;
 }
 
 interface ResultStream {
@@ -44,6 +46,9 @@ interface ActiveRecord {
 const scope = new AsyncLocalStorage<ActivityScope>();
 const active = new Map<string, ActiveRecord>();
 const unavailable = new Map<string, ModelActivityRecord>();
+const pendingTransports = new Map<string, ModelActivityRecord>();
+const untrackedTransport: ModelActivityLease = { finish() {}, unobservable() {} };
+const MAX_ACTIVE_RECORDS = 4096;
 const MAX_UNAVAILABLE_OWNERS = 512;
 let unavailableOverflow: ModelActivityRecord | undefined;
 export const modelActivityInstanceId = randomUUID();
@@ -52,6 +57,7 @@ let nextId = 0;
 /** 仅用于隔离测试进程内的用例；真实运行不能清掉未确认结束的事实。 */
 export function resetModelActivityForTests(): void {
 	active.clear();
+	pendingTransports.clear();
 	unavailable.clear();
 	unavailableOverflow = undefined;
 }
@@ -72,6 +78,7 @@ export function getModelActivity(): ModelActivityRecord[] {
 	return [
 		...Array.from(active.values(), entry => ({ ...entry.record })),
 		...Array.from(unavailable.values(), record => ({ ...record })),
+		...Array.from(pendingTransports.values(), record => ({ ...record })),
 		...(unavailableOverflow ? [{ ...unavailableOverflow }] : []),
 	];
 }
@@ -93,6 +100,7 @@ function begin(retain: true): ActivityObservation;
 function begin(retain?: false): ActivityObservation | undefined;
 function begin(retain = false): ActivityObservation | undefined {
 	const current = scope.getStore();
+	if (current?.observationId) pendingTransports.delete(current.observationId);
 	let entry = current?.callId ? active.get(current.callId) : undefined;
 	if (entry && !retain) return undefined;
 	const owner = current?.owner;
@@ -109,6 +117,11 @@ function begin(retain = false): ActivityObservation | undefined {
 			},
 			holders: 0,
 		};
+		if (active.size >= MAX_ACTIVE_RECORDS) {
+			rememberUnavailable(entry.record);
+			// 已无法逐条观测；结束通知不能清除已经记录的未知事实。
+			return { context: { owner }, finish() {}, unobservable() {} };
+		}
 		active.set(id, entry);
 	}
 	const held = entry;
@@ -132,7 +145,41 @@ function begin(retain = false): ActivityObservation | undefined {
 }
 
 export function retainModelActivity(): ModelActivityLease {
-	return begin(true);
+	return scope.getStore()?.suppressTransport ? untrackedTransport : begin(true);
+}
+
+/** 排队时捕获完整归属，真正发送时才开始活动。 */
+export function captureModelActivityStarter(): () => ModelActivityLease {
+	const context = scope.getStore() ?? {};
+	return () => scope.run(context, retainModelActivity);
+}
+
+/** 认证和资料查询不是模型调用；异步完成后恢复调用者的原活动作用域。 */
+export function withoutModelTransportActivity<T>(action: () => T): T {
+	return scope.run({ ...scope.getStore(), suppressTransport: true }, action);
+}
+
+/** 供应方尚未进入可观测传输时只报告缺口，不伪造模型请求编号。 */
+export function observeModelTransportStream<T extends ResultStream>(action: () => T): T {
+	const current = scope.getStore();
+	const owner = current?.owner;
+	const id = `pending:${++nextId}`;
+	const record: ModelActivityRecord = {
+		id, agentId: owner?.agentId, sessionId: owner?.sessionId,
+		rootSessionId: owner?.rootSessionId, startedAt: Date.now(), observable: false,
+	};
+	if (pendingTransports.size < MAX_ACTIVE_RECORDS) pendingTransports.set(id, record);
+	else rememberUnavailable(record);
+	const clear = () => pendingTransports.delete(id);
+	try {
+		const stream = scope.run({ ...current, observationId: id }, action);
+		try { void stream.result().then(clear, clear); }
+		catch { clear(); rememberUnavailable(record); }
+		return stream;
+	} catch (error) {
+		clear();
+		throw error;
+	}
 }
 
 /**

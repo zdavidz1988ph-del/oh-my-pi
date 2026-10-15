@@ -5,6 +5,7 @@ import {
 	type GitLabDuoWorkflowNamespaceSelection,
 } from "@oh-my-pi/pi-catalog/discovery/gitlab-duo-workflow";
 import * as AIError from "../error";
+import { captureModelActivityStarter, withoutModelTransportActivity, type ModelActivityLease } from "../model-activity";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import type {
 	Api,
@@ -1207,7 +1208,7 @@ async function runGitLabDuoWorkflow(
 	let setup: GitLabDuoWorkflowNamespaceSetup;
 	if (cachedNamespace) {
 		try {
-			setup = await setupForNamespace(cachedNamespace);
+			setup = await withoutModelTransportActivity(() => setupForNamespace(cachedNamespace));
 		} catch (cachedError) {
 			// The cached account namespace no longer works (revoked access, deleted
 			// group, membership change). Drop it and re-discover once from scratch.
@@ -1216,25 +1217,25 @@ async function runGitLabDuoWorkflow(
 				error: gitLabDuoWorkflowErrorText(cachedError),
 			});
 			clearGitLabDuoWorkflowCachedNamespace(apiKey, baseUrl, options.cwd);
-			const rediscovered = await resolveGitLabDuoWorkflowNamespaceSelection(
+			const rediscovered = await withoutModelTransportActivity(() => resolveGitLabDuoWorkflowNamespaceSelection(
 				model,
 				options,
 				apiKey,
 				baseUrl,
 				fetchImpl,
-			);
-			setup = await setupForNamespace(rediscovered);
+			));
+			setup = await withoutModelTransportActivity(() => setupForNamespace(rediscovered));
 			setGitLabDuoWorkflowCachedNamespace(apiKey, baseUrl, options.cwd, rediscovered);
 		}
 	} else {
-		const namespaceSelection = await resolveGitLabDuoWorkflowNamespaceSelection(
+		const namespaceSelection = await withoutModelTransportActivity(() => resolveGitLabDuoWorkflowNamespaceSelection(
 			model,
 			options,
 			apiKey,
 			baseUrl,
 			fetchImpl,
-		);
-		setup = await setupForNamespace(namespaceSelection);
+		));
+		setup = await withoutModelTransportActivity(() => setupForNamespace(namespaceSelection));
 		// Cache the freshly discovered namespace per account so the next session/turn
 		// reuses it instead of re-discovering. Explicit config is never cached.
 		if (!explicitNamespace) {
@@ -1698,7 +1699,7 @@ async function createGitLabDuoWorkflow(
 		projectId,
 		workflowDefinition,
 	});
-	const response = await fetchImpl(gitLabApiUrl(baseUrl, "/api/v4/ai/duo_workflows/workflows"), {
+	const response = await withoutModelTransportActivity(() => fetchImpl(gitLabApiUrl(baseUrl, "/api/v4/ai/duo_workflows/workflows"), {
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${apiKey}`,
@@ -1706,7 +1707,7 @@ async function createGitLabDuoWorkflow(
 		},
 		body: JSON.stringify(body),
 		signal: gitLabDuoWorkflowRestSignal(signal),
-	});
+	}));
 	traceGitLabDuoWorkflow("workflow.create.response", {
 		status: response.status,
 		ok: response.ok,
@@ -1743,7 +1744,7 @@ async function stopGitLabDuoWorkflow(
 	// otherwise leave the `runGitLabDuoWorkflow` promise unresolved forever — the
 	// bounded budget keeps cleanup best-effort in both directions.
 	try {
-		await fetchImpl(gitLabApiUrl(baseUrl, `/api/v4/ai/duo_workflows/workflows/${encodeURIComponent(workflowId)}`), {
+		await withoutModelTransportActivity(() => fetchImpl(gitLabApiUrl(baseUrl, `/api/v4/ai/duo_workflows/workflows/${encodeURIComponent(workflowId)}`), {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${apiKey}`,
@@ -1751,7 +1752,7 @@ async function stopGitLabDuoWorkflow(
 			},
 			body: JSON.stringify(buildGitLabDuoWorkflowStopBody()),
 			signal: gitLabDuoWorkflowRestSignal(),
-		});
+		}));
 	} catch (error) {
 		// Server-side stop is best-effort: a timeout / network fault must not reject
 		// the caller (the local stream already emitted its terminal event). Trace and
@@ -1857,6 +1858,13 @@ export function runGitLabDuoWorkflowSocket(
 ): Promise<GitLabDuoWorkflowSocketResult> {
 	const { promise, resolve, reject } = Promise.withResolvers<GitLabDuoWorkflowSocketResult>();
 	let settled = false;
+	const startActivity = captureModelActivityStarter();
+	let activity: ModelActivityLease | undefined;
+	const send = (payload: string): void => {
+		activity ??= startActivity();
+		try { ws.send(payload); }
+		catch (error) { activity.unobservable(); throw error; }
+	};
 	let idleTimer: NodeJS.Timeout | undefined;
 	const clearIdleTimer = (): void => {
 		if (idleTimer !== undefined) {
@@ -1867,6 +1875,8 @@ export function runGitLabDuoWorkflowSocket(
 	const settle = (result: GitLabDuoWorkflowSocketResult = "closed", error?: unknown): void => {
 		if (settled) return;
 		settled = true;
+		if (!error && (result === "terminal" || result === "action" || result === "approval")) activity?.finish();
+		else activity?.unobservable();
 		clearIdleTimer();
 		if (error) reject(error);
 		else resolve(result);
@@ -2006,7 +2016,7 @@ export function runGitLabDuoWorkflowSocket(
 		// outbox future and the workflow continues on the same connection.
 		const responses = Array.isArray(resumeResponse) ? resumeResponse : [resumeResponse];
 		for (const response of responses) {
-			ws.send(JSON.stringify(response));
+			send(JSON.stringify(response));
 		}
 	} else {
 		ws.onopen = () => {
@@ -2019,7 +2029,7 @@ export function runGitLabDuoWorkflowSocket(
 				mcpTools: startPayload.mcpTools.length,
 				preapprovedTools: startPayload.preapproved_tools.length,
 			});
-			ws.send(JSON.stringify({ startRequest: startPayload }));
+			send(JSON.stringify({ startRequest: startPayload }));
 		};
 	}
 	resetIdleTimer();

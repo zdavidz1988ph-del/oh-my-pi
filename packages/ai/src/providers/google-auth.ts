@@ -18,6 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $envpos, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { withoutModelTransportActivity } from "../model-activity";
 import type { FetchImpl } from "../types";
 import { raceWithSignal } from "../utils/abort";
 
@@ -314,10 +315,10 @@ export async function getVertexAccessToken(options?: { signal?: AbortSignal; fet
 	// Each caller races its own signal against the shared promise instead.
 	const promise = (async () => {
 		try {
-			const { source, token } = await resolveAccessTokenUncached(
+			const { source, token } = await withoutModelTransportActivity(() => resolveAccessTokenUncached(
 				AbortSignal.timeout(SHARED_TOKEN_RESOLVE_TIMEOUT_MS),
 				fetchImpl,
-			);
+			));
 			const expiresAtMs = Date.now() + Math.max(0, token.expires_in * 1000);
 			tokenCache.set(source, { token: token.access_token, expiresAtMs });
 			logger.debug("vertex.adc acquired access token", { source, expiresInSec: token.expires_in });
