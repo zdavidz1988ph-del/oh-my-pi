@@ -183,6 +183,11 @@ export type CodexSteerPlan =
 	/** The request cannot line up with the server's queue: drop the socket and replay in full. */
 	| { kind: "discard" };
 
+/** 与接续计划共用工具结果分类，涵盖函数工具和自定义工具。 */
+export function isCodexToolOutput(item: InputItem): boolean {
+	return typeof item.type === "string" && item.type.endsWith("_output");
+}
+
 /**
  * Line the next request up with steering the server accepted for the previous
  * response.
@@ -210,7 +215,7 @@ export function planSteeredRequest(
 	if (next < steering.length) return { kind: "discard" };
 	if (rest.length === 0) return { kind: "attach" };
 	// Client-owned results (`*_output`) mean the server is waiting for them.
-	if (rest.some(item => typeof item.type === "string" && item.type.endsWith("_output"))) {
+	if (rest.some(isCodexToolOutput)) {
 		return { kind: "create", input: rest };
 	}
 	return { kind: "discard" };

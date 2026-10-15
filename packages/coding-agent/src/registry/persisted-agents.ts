@@ -447,6 +447,7 @@ interface RosterConflict {
 	sessionFile: AgentRef["sessionFile"] | undefined;
 	session: AgentRef["session"] | undefined;
 	status: AgentRef["status"] | undefined;
+	identity: RosterIdentity;
 }
 
 interface PersistedRosterLatch {
@@ -454,17 +455,8 @@ interface PersistedRosterLatch {
 	pending: Promise<void>;
 	/** True once `pending` has settled; only settled latches are evictable. */
 	settled: boolean;
-	/**
-	 * Narrowest root-ownership token: every (id → sessionFile) pair this root's
-	 * scan restored as a parked ref — registered fresh, replaced from another
-	 * root, or confirmed already pointing at this root's own transcript. A
-	 * settled latch is reusable only while every recorded ref still matches
-	 * registry identity/session; a missing or re-targeted ref means another
-	 * root's scan (or a release) moved the id, so this root must be re-scanned.
-	 * Rebuilt per scan, the token stays bounded by the root's own transcript
-	 * tree — no reverse global map.
-	 */
-	owned: Map<string, string>;
+	/** 记录路径、类型、父身份、根身份与实际会话身份；任意身份变化都会使旧扫描失效。 */
+	owned: Map<string, RosterIdentity>;
 	/** 已存在但不能抢占的其他身份；冲突消失或状态改变后才重新扫描。 */
 	conflicts: Map<string, RosterConflict>;
 }
@@ -481,10 +473,42 @@ interface RegistryWithPersistedRosterLatches extends AgentRegistry {
  * invalidates the latch, forcing a re-scan that restores this root's own
  * transcripts. Refs the scan did not restore are not this root's to police.
  */
-function latchOwnershipValid(registry: AgentRegistry, owned: Map<string, string>): boolean {
-	for (const [id, sessionFile] of owned) {
+function rosterIdentity(ref: AgentRef | undefined) {
+	return {
+		sessionFile: ref?.sessionFile,
+		kind: ref?.kind,
+		parentId: ref?.parentId,
+		rootSessionId: ref?.rootSessionId,
+		sessionId: ref?.session?.sessionId ?? ref?.sessionId,
+	};
+}
+
+type RosterIdentity = ReturnType<typeof rosterIdentity>;
+
+function rosterIdentityMatches(ref: AgentRef | undefined, identity: RosterIdentity): boolean {
+	return (
+		ref?.sessionFile === identity.sessionFile &&
+		ref?.kind === identity.kind &&
+		ref?.parentId === identity.parentId &&
+		ref?.rootSessionId === identity.rootSessionId &&
+		(ref?.session?.sessionId ?? ref?.sessionId) === identity.sessionId
+	);
+}
+
+function rosterConflict(ref: AgentRef | undefined): RosterConflict {
+	return {
+		ref,
+		sessionFile: ref?.sessionFile,
+		session: ref?.session,
+		status: ref?.status,
+		identity: rosterIdentity(ref),
+	};
+}
+
+function latchOwnershipValid(registry: AgentRegistry, owned: Map<string, RosterIdentity>): boolean {
+	for (const [id, identity] of owned) {
 		const ref = registry.get(id);
-		if (!ref || ref.sessionFile !== sessionFile) return false;
+		if (!ref || !rosterIdentityMatches(ref, identity)) return false;
 	}
 	return true;
 }
@@ -493,11 +517,11 @@ function latchConflictsValid(registry: AgentRegistry, conflicts: Map<string, Ros
 	for (const [id, conflict] of conflicts) {
 		const ref = registry.get(id);
 		if (
-			!ref ||
 			ref !== conflict.ref ||
-			ref.sessionFile !== conflict.sessionFile ||
-			ref.session !== conflict.session ||
-			ref.status !== conflict.status
+			ref?.sessionFile !== conflict.sessionFile ||
+			ref?.session !== conflict.session ||
+			ref?.status !== conflict.status ||
+			!rosterIdentityMatches(ref, conflict.identity)
 		)
 			return false;
 	}
@@ -508,15 +532,15 @@ function recordRosterIdentity(
 	registry: AgentRegistry,
 	id: string,
 	sessionFile: string,
-	owned?: Map<string, string>,
+	owned?: Map<string, RosterIdentity>,
 	conflicts?: Map<string, RosterConflict>,
 ): void {
 	const ref = registry.get(id);
 	if (ref?.kind === "sub" && ref.sessionFile === sessionFile) {
-		owned?.set(id, sessionFile);
+		owned?.set(id, rosterIdentity(ref));
 		conflicts?.delete(id);
 	} else {
-		conflicts?.set(id, { ref, sessionFile: ref?.sessionFile, session: ref?.session, status: ref?.status });
+		conflicts?.set(id, rosterConflict(ref));
 	}
 }
 
@@ -693,7 +717,7 @@ export async function registerPersistedSubagents(
 		 * root-ownership token `ensurePersistedRoster` validates settled latches
 		 * against, bounded by this root's own transcript tree.
 		 */
-		owned?: Map<string, string>;
+		owned?: Map<string, RosterIdentity>;
 		conflicts?: Map<string, RosterConflict>;
 	} = {},
 ): Promise<void> {
@@ -708,6 +732,8 @@ export async function registerPersistedSubagents(
 	if (!shouldContinue()) return;
 	const root = sessionFile.slice(0, -6);
 	const transcripts: PersistedTranscript[] = [];
+	// 先登记根日志声明的成员；缺目录或缺子日志也不能被当成完整名册。
+	for (const id of vibeOwnedIds) options.conflicts?.set(id, rosterConflict(registry.get(id)));
 	await registerPersistedSubagentsFromDir(
 		registry,
 		root,
@@ -745,7 +771,7 @@ async function registerPersistedSubagentsFromDir(
 	shouldContinue: () => boolean,
 	rootSessionFile: string,
 	rootSessionId: string | undefined,
-	owned?: Map<string, string>,
+	owned?: Map<string, RosterIdentity>,
 	conflicts?: Map<string, RosterConflict>,
 ): Promise<void> {
 	if (!shouldContinue()) return;
@@ -805,7 +831,7 @@ async function registerPersistedSubagentsFromDir(
 					history: { ...metadata.history, readOnly: true },
 					status: "parked",
 				});
-				owned?.set(advisorId, sessionFile);
+				owned?.set(advisorId, rosterIdentity(registry.get(advisorId)));
 				transcripts.push({
 					id: advisorId,
 					sessionFile,
@@ -813,7 +839,7 @@ async function registerPersistedSubagentsFromDir(
 					lastActivity: metadata.lastActivity,
 				});
 			} else if (existing) {
-				owned?.set(advisorId, sessionFile);
+				owned?.set(advisorId, rosterIdentity(existing));
 				transcripts.push({
 					id: advisorId,
 					sessionFile,
@@ -824,8 +850,30 @@ async function registerPersistedSubagentsFromDir(
 			continue;
 		}
 		const id = entry.name.slice(0, -6);
-		const existing = registry.get(id);
-		if (vibeOwnedIds.has(id) && existing?.sessionFile !== sessionFile) continue;
+		let existing = registry.get(id);
+		if (vibeOwnedIds.has(id)) {
+			if (existing?.sessionFile !== sessionFile) {
+				conflicts?.set(id, rosterConflict(existing));
+				continue;
+			}
+			const metadata = await readPersistedAgentMetadata(sessionFile);
+			if (!shouldContinue()) return;
+			existing = registry.get(id);
+			if (
+				!existing ||
+				existing.kind !== "sub" ||
+				existing.sessionFile !== sessionFile ||
+				existing.parentId !== (parentId ?? MAIN_AGENT_ID) ||
+				!rootSessionId ||
+				existing.rootSessionId !== rootSessionId ||
+				!metadata.sessionId ||
+				(existing.session?.sessionId ?? existing.sessionId) !== metadata.sessionId
+			) {
+				conflicts?.set(id, rosterConflict(existing));
+				continue;
+			}
+			conflicts?.delete(id);
+		}
 		let tombstoned = false;
 		try {
 			await fs.promises.access(getAgentTombstonePath(sessionFile));
@@ -846,7 +894,7 @@ async function registerPersistedSubagentsFromDir(
 			!sessionFileBelongsToRoot(existing.sessionFile, rootSessionFile);
 		if (existing && !replaceable) {
 			if (existing.kind === "sub" && existing.sessionFile === sessionFile) {
-				owned?.set(id, sessionFile);
+				owned?.set(id, rosterIdentity(existing));
 				transcripts.push({
 					id,
 					sessionFile,
@@ -894,7 +942,7 @@ async function registerPersistedSubagentsFromDir(
 				const vacated = stillUnclaimed || (expected !== null && registry.unregister(id, expected));
 				if (vacated && registry.registerIfAvailable(input, null)) {
 					const ref = registry.get(id);
-					owned?.set(id, sessionFile);
+					if (ref) owned?.set(id, rosterIdentity(ref));
 					transcripts.push({
 						id,
 						sessionFile,

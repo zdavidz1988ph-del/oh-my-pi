@@ -15,6 +15,7 @@ import {
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { withoutModelTransportActivity } from "../model-activity";
 import type {
 	Api,
 	AssistantMessage,
@@ -580,7 +581,11 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			}
 			// The backend gates newer models on the client version; a process that
 			// skipped discovery (fresh model cache) must still send the current one.
-			if (isAntigravity) await ensureAntigravityVersion(options?.fetch ?? fetch, options?.signal);
+			if (isAntigravity) {
+				await withoutModelTransportActivity(() =>
+					ensureAntigravityVersion(options?.fetch ?? fetch, options?.signal),
+				);
+			}
 			const headers = isAntigravity ? { "User-Agent": getAntigravityUserAgent() } : getGeminiCliHeaders(model.id);
 
 			const requestHeaders = {
@@ -949,6 +954,8 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					if (!response.ok) {
 						if (AIError.isTransientStatus(response.status)) {
 							if (!isLastEndpoint) {
+								// 切换地址前释放错误响应，不能留下仍在读取的传输。
+								await response.body?.cancel();
 								continue;
 							}
 						}
@@ -973,6 +980,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 					for (let emptyAttempt = 0; emptyAttempt <= MAX_EMPTY_STREAM_RETRIES; emptyAttempt++) {
 						if (options?.signal?.aborted) {
+							if (!currentResponse.bodyUsed) await currentResponse.body?.cancel();
 							throw new AIError.AbortError("Request was aborted");
 						}
 
@@ -1005,7 +1013,13 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							}
 						}
 
-						const streamed = await streamResponse(currentResponse);
+						let streamed: Awaited<ReturnType<typeof streamResponse>>;
+						try {
+							streamed = await streamResponse(currentResponse);
+						} finally {
+							// 读取器尚未接管就退出时，仍要释放响应体。
+							if (!currentResponse.bodyUsed) await currentResponse.body?.cancel();
+						}
 						// Eventless silence may fail over to the alternate Antigravity
 						// endpoint. Once thinking has streamed, the endpoint is already
 						// committed downstream; Advisor mode may accept that silence,

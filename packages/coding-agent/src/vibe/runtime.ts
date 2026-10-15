@@ -608,10 +608,14 @@ export class VibeSessionRegistry {
 			if (!persisted?.init) return undefined;
 			let sessionId: string | undefined;
 			// 只读真实日志头；文件名是人物名，不是会话编号。
-			await visitEntriesFromFileStream(childSessionFile, entry => {
-				if (entry.type === "session" && typeof entry.id === "string") sessionId = entry.id;
-				return false;
-			}, { maxRecords: 1 });
+			await visitEntriesFromFileStream(
+				childSessionFile,
+				entry => {
+					if (entry.type === "session" && typeof entry.id === "string") sessionId = entry.id;
+					return false;
+				},
+				{ maxRecords: 1 },
+			);
 			return { childSessionFile, sessionId };
 		} catch {
 			return undefined;
@@ -673,10 +677,13 @@ export class VibeSessionRegistry {
 		) {
 			return;
 		}
-		if (existing && identity && (
-			(existing.rootSessionId && identity.rootSessionId && existing.rootSessionId !== identity.rootSessionId) ||
-			(existing.sessionId && identity.sessionId && existing.sessionId !== identity.sessionId)
-		)) return;
+		if (
+			existing &&
+			identity &&
+			((existing.rootSessionId && identity.rootSessionId && existing.rootSessionId !== identity.rootSessionId) ||
+				(existing.sessionId && identity.sessionId && existing.sessionId !== identity.sessionId))
+		)
+			return;
 		const rootSessionId = existing?.rootSessionId ?? expected?.rootSessionId ?? identity?.rootSessionId;
 		const sessionId = existing?.sessionId ?? expected?.sessionId ?? identity?.sessionId;
 		if (existing?.status === "aborted" && !existing.session) {
@@ -714,8 +721,9 @@ export class VibeSessionRegistry {
 		const sessionManager = session.sessionManager;
 		if (!sessionFile || !sessionManager) return 0;
 		const scope = this.ownerScope(session);
-		const rootSessionId = session.getRootSessionId?.() ??
-			(scope.ownerId === MAIN_AGENT_ID ? sessionManager.getSessionId() : undefined);
+		const rootSessionId =
+			session.getRootSessionId?.() ??
+			(scope.ownerId === MAIN_AGENT_ID ? sessionManager.getSessionId?.() : undefined);
 		const allSpawns = new Map<string, VibeSpawnLifecycleEvent>();
 		const terminalIntents = new Map<string, VibeTombstoneReason>();
 		for (const entry of sessionManager.getEntries()) {

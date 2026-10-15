@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as path from "node:path";
 import { Agent, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import { observeModelStream, retainModelActivity, withModelActivityOwner } from "@oh-my-pi/pi-ai";
@@ -9,6 +9,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { RpcRuntimeActivityReader } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-runtime-activity";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
+import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -16,13 +18,15 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const resources: Array<() => Promise<void> | void> = [];
+// 其他协议测试会故意制造进程级失联；本夹具从独立的空活动表开始。
+beforeEach(() => resetModelActivityForTests());
 afterEach(async () => {
 	for (const dispose of resources.reverse()) await dispose();
 	resources.length = 0;
 	resetModelActivityForTests();
 });
 
-function fixture() {
+function fixture(mainManager?: SessionManager) {
 	const temp = TempDir.createSync("@rpc-runtime-activity-");
 	resources.push(() => temp.removeSync());
 	const auth = createInMemoryAuthStorage();
@@ -33,7 +37,7 @@ function fixture() {
 	if (!model) throw new Error("缺少测试模型定义");
 	const questions = new Map<string, string>();
 	const create = (id: string, rootSessionId?: string) => {
-		const manager = SessionManager.inMemory(temp.path());
+		const manager = id === "Main" && mainManager ? mainManager : SessionManager.inMemory(temp.path());
 		const root = rootSessionId ?? manager.getSessionId();
 		const scope = <T>(action: () => T) =>
 			withModelActivityOwner({ agentId: id, sessionId: manager.getSessionId(), rootSessionId: root }, action);
@@ -238,4 +242,83 @@ test("真实并发请求超过接收上限时保留有界编号并明确不完�
 		for (const lease of leases) lease.finish();
 	}
 	expect(reader.snapshot().agents[0]).toMatchObject({ complete: true, modelRequestIds: [] });
+});
+
+test("RPC 对未恢复的真实 Vibe 日志报告缺口，准确登记后才完整", async () => {
+	const temp = TempDir.createSync("@rpc-vibe-roster-");
+	resources.push(() => temp.removeSync());
+	const rootFile = path.join(temp.path(), "main.jsonl");
+	const childFile = path.join(temp.path(), "main", "Worker.jsonl");
+	const header = (id: string) =>
+		JSON.stringify({
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id,
+			timestamp: "2026-08-25T10:00:00.000Z",
+			cwd: temp.path(),
+		});
+	await Bun.write(
+		rootFile,
+		`${header("vibe-rpc-root")}\n${JSON.stringify({
+			type: "custom",
+			id: "spawn",
+			parentId: null,
+			timestamp: "2026-08-25T10:00:01.000Z",
+			customType: "vibe-session-lifecycle",
+			data: {
+				version: 1,
+				action: "spawn",
+				id: "Worker",
+				ownerId: "Main",
+				parentSessionId: "vibe-rpc-root",
+				cli: "fast",
+				agent: "task",
+				childSessionFile: "Worker.jsonl",
+				createdAt: 1,
+			},
+		})}\n`,
+	);
+	await Bun.write(
+		childFile,
+		`${header("vibe-rpc-child")}\n${JSON.stringify({
+			type: "session_init",
+			id: "init",
+			parentId: null,
+			timestamp: "2026-08-25T10:00:01.000Z",
+			systemPrompt: "检查",
+			task: "检查",
+			tools: ["read"],
+		})}\n`,
+	);
+	const { reader, registry } = fixture(await SessionManager.open(rootFile));
+	await ensurePersistedRoster(registry, rootFile);
+	expect(reader.snapshot()).toMatchObject({ complete: false, gaps: ["roster_loading"] });
+	expect(registry.get("Worker")).toBeUndefined();
+	registry.register({
+		id: "Worker",
+		displayName: "Worker",
+		kind: "sub",
+		parentId: "Main",
+		rootSessionId: "vibe-rpc-root",
+		sessionId: "vibe-rpc-child",
+		session: null,
+		sessionFile: childFile,
+		status: "parked",
+	});
+	await ensurePersistedRoster(registry, rootFile);
+	const snapshot = reader.snapshot();
+	expect(snapshot.complete).toBe(true);
+	expect(snapshot.gaps).toEqual([]);
+	expect(snapshot.agents.find(actor => actor.id === "Worker")).toMatchObject({
+		sessionId: "vibe-rpc-child",
+		status: "parked",
+		complete: true,
+		modelRequestIds: [],
+		toolCallIds: [],
+		pendingQuestionIds: [],
+		waitingForResult: false,
+	});
+	registry.get("Worker")!.sessionId = "wrong";
+	expect(reader.snapshot().complete).toBe(false);
+	await ensurePersistedRoster(registry, rootFile);
 });

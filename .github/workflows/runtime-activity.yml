@@ -43,6 +43,9 @@ jobs:
           packages/ai/test/gitlab-duo-workflow-provider.test.ts
           packages/ai/test/gitlab-duo-cache-key.test.ts
           packages/ai/test/openai-codex-stream.test.ts
+          packages/ai/test/openai-codex-live-steering.test.ts
+          packages/ai/test/google-gemini-cli-first-event-timeout.test.ts
+          packages/agent/test/remote-compaction.test.ts
           packages/coding-agent/test/local-inference-api.test.ts
           packages/coding-agent/test/tiny-model-settings-live.test.ts
           packages/coding-agent/test/issue-1940-repro.test.ts

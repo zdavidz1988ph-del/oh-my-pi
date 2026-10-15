@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { getModelActivity, resetModelActivityForTests, withModelActivityOwner } from "@oh-my-pi/pi-ai/model-activity";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
@@ -22,6 +23,8 @@ const originalWebSocket = global.WebSocket;
 const USAGE = { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } };
 
 beforeEach(() => {
+	// 上限测试会留下进程级未知；每个协议场景独立开始，场景内不得清表掩盖残留。
+	resetModelActivityForTests();
 	setAgentDir(TempDir.createSync("@pi-codex-steer-").path());
 	vi.spyOn(piUtils, "getInstallId").mockReturnValue("00000000-0000-4000-8000-000000000001");
 });
@@ -221,73 +224,111 @@ describe("codex live steering", () => {
 		expect(ScriptedWebSocket.instances).toHaveLength(1);
 	});
 
-	it("returns pending tool output without repeating steering the server already queued", async () => {
-		installSocket((frame, socket) => {
-			if (frame.type === "response.create" && creates().length === 1) {
-				const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "status", arguments: "{}" };
+	it.each([
+		["function_call", false],
+		["custom_tool_call", false],
+		["function_call", true],
+		["custom_tool_call", true],
+	] as const)(
+		"工具结果接续保留真实活动：%s，发送失败=%s",
+		async (callType, failSend) => {
+			const activityBefore = getModelActivity();
+			const rootSessionId = `steer-tool-${callType}-${failSend}`;
+			const owner = failSend ? { agentId: "Main", sessionId: rootSessionId, rootSessionId } : undefined;
+			const call =
+				callType === "custom_tool_call"
+					? { type: callType, id: "ctc_1", call_id: "call_1", name: "eval", input: "print(1)" }
+					: { type: callType, id: "fc_1", call_id: "call_1", name: "status", arguments: "{}" };
+			installSocket((frame, socket) => {
+				if (frame.type === "response.create" && creates().length === 1) {
+					socket.emit(
+						{ type: "response.created", response: { id: "resp_1" } },
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: {
+								...call,
+								...(callType === "custom_tool_call" ? { input: "" } : { arguments: "" }),
+							},
+						},
+					);
+					return;
+				}
+				if (frame.type === "response.steer") {
+					socket.emit(
+						{ type: "response.steer.accepted", steer: { id: "steer_1", previous_response_id: "resp_1" } },
+						{ type: "response.output_item.done", output_index: 0, item: { ...call, status: "completed" } },
+						{ type: "response.completed", response: { id: "resp_1", status: "completed", usage: USAGE } },
+						{
+							type: "response.steer.pending",
+							steer: { id: "steer_1", previous_response_id: "resp_1" },
+							reason: "waiting_for_required_input",
+							required_input: [{ type: `${callType}_output`, call_id: "call_1", name: call.name }],
+						},
+					);
+					return;
+				}
+				if (failSend) throw new Error("websocket error: 模拟工具结果尚未送出时连接失败");
 				socket.emit(
-					{ type: "response.created", response: { id: "resp_1" } },
-					{ type: "response.output_item.added", output_index: 0, item: { ...call, arguments: "" } },
+					{ type: "response.created", response: { id: "resp_2" } },
+					...messageFrames("msg_2", "Scoped down"),
+					{ type: "response.completed", response: { id: "resp_2", status: "completed", usage: USAGE } },
 				);
-				return;
+			});
+			const model = { ...createGpt6Model(), applyPatchToolType: "freeform" as const };
+			const state = new Map<string, ProviderSessionState>();
+			const steering = oneShotSteering("keep it small");
+			const user: UserMessage = { role: "user", content: "Plan the project", timestamp: Date.now() };
+
+			const first = await withModelActivityOwner(owner, () =>
+				streamOpenAICodexResponses(
+					model,
+					{ systemPrompt: SYSTEM, messages: [user] },
+					options(state, steering.source),
+				),
+			).result();
+			expect(steering.settled()).toBe("accepted");
+			expect(first.stopReason).toBe("toolUse");
+			expect(getModelActivity().filter(record => !activityBefore.some(old => old.id === record.id))).toEqual([
+				expect.objectContaining({ observable: false }),
+			]);
+			const toolCall = first.content.find(block => block.type === "toolCall");
+			if (toolCall?.type !== "toolCall") throw new Error("expected a tool call");
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				content: [{ type: "text", text: "design done" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+			const steerMessage: UserMessage = { role: "user", content: "keep it small", timestamp: Date.now() };
+
+			const second = await withModelActivityOwner(owner, () =>
+				streamOpenAICodexResponses(
+					model,
+					{ systemPrompt: SYSTEM, messages: [user, first, toolResult, steerMessage] },
+					{ ...options(state), codexSseMaxAttempts: 1 },
+				),
+			).result();
+			if (failSend) {
+				expect(second.stopReason).toBe("error");
+				expect(getModelActivity().filter(record => record.rootSessionId === rootSessionId)).toEqual([
+					expect.objectContaining({ ...owner, observable: false }),
+				]);
+			} else {
+				expect(second.stopReason).toBe("stop");
+				expect(getModelActivity()).toEqual(activityBefore);
 			}
-			if (frame.type === "response.steer") {
-				const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "status", arguments: "{}" };
-				socket.emit(
-					{ type: "response.steer.accepted", steer: { id: "steer_1", previous_response_id: "resp_1" } },
-					{ type: "response.output_item.done", output_index: 0, item: { ...call, status: "completed" } },
-					{ type: "response.completed", response: { id: "resp_1", status: "completed", usage: USAGE } },
-					{
-						type: "response.steer.pending",
-						steer: { id: "steer_1", previous_response_id: "resp_1" },
-						reason: "waiting_for_required_input",
-						required_input: [{ type: "function_call_output", call_id: "call_1", name: "status" }],
-					},
-				);
-				return;
-			}
-			socket.emit(
-				{ type: "response.created", response: { id: "resp_2" } },
-				...messageFrames("msg_2", "Scoped down"),
-				{ type: "response.completed", response: { id: "resp_2", status: "completed", usage: USAGE } },
-			);
-		});
-		const model = createGpt6Model();
-		const state = new Map<string, ProviderSessionState>();
-		const steering = oneShotSteering("keep it small");
-		const user: UserMessage = { role: "user", content: "Plan the project", timestamp: Date.now() };
 
-		const first = await streamOpenAICodexResponses(
-			model,
-			{ systemPrompt: SYSTEM, messages: [user] },
-			options(state, steering.source),
-		).result();
-		expect(steering.settled()).toBe("accepted");
-		expect(first.stopReason).toBe("toolUse");
-		const toolCall = first.content.find(block => block.type === "toolCall");
-		if (toolCall?.type !== "toolCall") throw new Error("expected a tool call");
-		const toolResult: ToolResultMessage = {
-			role: "toolResult",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			content: [{ type: "text", text: "design done" }],
-			isError: false,
-			timestamp: Date.now(),
-		};
-		const steerMessage: UserMessage = { role: "user", content: "keep it small", timestamp: Date.now() };
-
-		await streamOpenAICodexResponses(
-			model,
-			{ systemPrompt: SYSTEM, messages: [user, first, toolResult, steerMessage] },
-			options(state),
-		).result();
-
-		const continuation = creates()[1];
-		expect(continuation?.previous_response_id).toBe("resp_1");
-		expect(continuation?.input).toEqual([
-			expect.objectContaining({ type: "function_call_output", call_id: "call_1", output: "design done" }),
-		]);
-	});
+			const continuation = creates()[1];
+			expect(continuation?.previous_response_id).toBe("resp_1");
+			expect(continuation?.input).toEqual([
+				expect.objectContaining({ type: `${callType}_output`, call_id: "call_1", output: "design done" }),
+			]);
+		},
+		30_000,
+	);
 
 	it("hands rejected steering back and sends it as ordinary input next time", async () => {
 		installSocket((frame, socket) => {
@@ -462,6 +503,166 @@ describe("codex live steering", () => {
 			{ role: "user", content: [{ type: "input_text", text: "Hello" }] },
 			{ role: "user", content: [{ type: "input_text", text: "one more thing" }] },
 		]);
+	});
+	for (const buffered of [false, true]) {
+		it(`自动续答在附接前按真实收发记账，已缓存结束=${buffered}`, async () => {
+			const activityBefore = getModelActivity();
+			const rootSessionId = `steer-activity-${buffered}`;
+			const owner = { agentId: "Worker", sessionId: rootSessionId, rootSessionId };
+			const activity = () => getModelActivity().filter(record => record.rootSessionId === rootSessionId);
+			installSocket((frame, socket) => {
+				if (frame.type === "response.create") {
+					socket.emit(
+						{ type: "response.created", response: { id: "activity-first" } },
+						...messageFrames("activity-message", "计划"),
+					);
+				} else {
+					socket.emit(
+						{
+							type: "response.steer.accepted",
+							steer: { id: "activity-steer", previous_response_id: "activity-first" },
+						},
+						{
+							type: "response.incomplete",
+							response: {
+								id: "activity-first",
+								status: "incomplete",
+								incomplete_details: { reason: "steered" },
+								usage: USAGE,
+							},
+						},
+					);
+				}
+			});
+			const model = createGpt6Model();
+			const state = new Map<string, ProviderSessionState>();
+			const steering = oneShotSteering("继续");
+			const user: UserMessage = { role: "user", content: "制定计划", timestamp: Date.now() };
+			const first = await withModelActivityOwner(owner, () =>
+				streamOpenAICodexResponses(
+					model,
+					{ systemPrompt: SYSTEM, messages: [user] },
+					options(state, steering.source),
+				),
+			).result();
+			expect(steering.settled()).toBe("accepted");
+			expect(activity()).toEqual([expect.objectContaining({ ...owner, observable: false })]);
+			const socket = ScriptedWebSocket.instances[0]!;
+			const duplicate = {
+				type: "response.steer.accepted",
+				steer: {
+					id: "activity-steer",
+					previous_response_id: "activity-first",
+				},
+			};
+			socket.emit(duplicate);
+			await Promise.resolve();
+			expect(activity()).toEqual([expect.objectContaining({ ...owner, observable: false })]);
+			withModelActivityOwner({ agentId: "Other", sessionId: "other", rootSessionId: "other" }, () =>
+				socket.emit({ type: "response.created", response: { id: "activity-next" } }),
+			);
+			await Promise.resolve();
+			expect(activity()).toEqual([expect.objectContaining({ ...owner, observable: true })]);
+			const activeId = activity()[0]!.id;
+			socket.emit(duplicate);
+			await Promise.resolve();
+			expect(
+				getModelActivity()
+					.map(record => JSON.stringify(record))
+					.sort(),
+			).toEqual([...activityBefore, ...activity()].map(record => JSON.stringify(record)).sort());
+			const complete = () =>
+				socket.emit(...messageFrames("activity-next-message", "已继续"), {
+					type: "response.completed",
+					response: { id: "activity-next", status: "completed", usage: USAGE },
+				});
+			if (buffered) {
+				complete();
+				await Promise.resolve();
+				expect(activity()).toEqual([]);
+			}
+			const second = withModelActivityOwner(owner, () =>
+				streamOpenAICodexResponses(
+					model,
+					{
+						systemPrompt: SYSTEM,
+						messages: [user, first, { role: "user", content: "继续", timestamp: Date.now() }],
+					},
+					options(state),
+				),
+			);
+			if (!buffered) {
+				expect(activity().map(record => record.id)).toEqual([activeId]);
+				complete();
+			}
+			const result = await second.result();
+			expect(result.responseId).toBe("activity-next");
+			expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "已继续" })]);
+			expect(activity()).toEqual([]);
+			socket.emit(duplicate);
+			await Promise.resolve();
+			expect(getModelActivity()).toEqual(activityBefore);
+			expect(creates()).toHaveLength(1);
+		});
+	}
+
+	it("第三轮创建前后收到第一轮旧终态，都不能结算第三轮", async () => {
+		const owner = { agentId: "Main", sessionId: "old-frame-three", rootSessionId: "old-frame-three" };
+		const activity = () => getModelActivity().filter(record => record.rootSessionId === owner.rootSessionId);
+		const thirdSent = Promise.withResolvers<ScriptedWebSocket>();
+		const finish = (socket: ScriptedWebSocket, n: number) =>
+			socket.emit(...messageFrames(`old-message-${n}`, `答复${n}`), {
+				type: "response.completed",
+				response: { id: `old-response-${n}`, status: "completed", usage: USAGE },
+			});
+		installSocket((frame, socket) => {
+			if (frame.type !== "response.create") return;
+			const n = creates().length;
+			if (n === 3) {
+				thirdSent.resolve(socket);
+				return;
+			}
+			socket.emit({ type: "response.created", response: { id: `old-response-${n}` } });
+			finish(socket, n);
+		});
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		const context: Context = { systemPrompt: SYSTEM, messages: [] };
+		for (let n = 1; n <= 2; n++) {
+			context.messages.push({ role: "user", content: `问题${n}`, timestamp: n });
+			const result = await withModelActivityOwner(owner, () =>
+				streamOpenAICodexResponses(model, context, options(state)),
+			).result();
+			expect(result.responseId).toBe(`old-response-${n}`);
+			context.messages.push(result);
+		}
+		context.messages.push({ role: "user", content: "问题3", timestamp: 3 });
+		const result = withModelActivityOwner(owner, () =>
+			streamOpenAICodexResponses(model, context, options(state)),
+		).result();
+		const socket = await thirdSent.promise;
+		const before = activity();
+		expect(before).toEqual([expect.objectContaining({ ...owner, observable: true })]);
+		const oldFrame = {
+			type: "response.completed",
+			response: {
+				id: "old-response-1",
+				status: "completed",
+				usage: USAGE,
+			},
+		};
+		socket.emit(oldFrame);
+		await Promise.resolve();
+		expect(activity()).toEqual(before);
+		socket.emit({ type: "response.created", response: { id: "old-response-3" } }, oldFrame);
+		await Promise.resolve();
+		expect(activity()).toEqual(before);
+		finish(socket, 3);
+		const third = await result;
+		expect(third.responseId).toBe("old-response-3");
+		expect(third.content).toEqual([expect.objectContaining({ type: "text", text: "答复3" })]);
+		expect(activity()).toEqual([]);
+		expect(ScriptedWebSocket.instances).toHaveLength(1);
 	});
 });
 

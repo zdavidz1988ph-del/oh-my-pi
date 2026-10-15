@@ -154,6 +154,16 @@ export function captureModelActivityStarter(): () => ModelActivityLease {
 	return () => scope.run(context, retainModelActivity);
 }
 
+/** 附接既有传输时确认观察已接通，不凭空创建第二个模型请求。 */
+export function captureModelTransportObservation(): () => void {
+	const id = scope.getStore()?.observationId;
+	return id === undefined
+		? untrackedTransport.finish
+		: () => {
+				pendingTransports.delete(id);
+			};
+}
+
 /** 认证和资料查询不是模型调用；异步完成后恢复调用者的原活动作用域。 */
 export function withoutModelTransportActivity<T>(action: () => T): T {
 	return scope.run({ ...scope.getStore(), suppressTransport: true }, action);
@@ -165,16 +175,24 @@ export function observeModelTransportStream<T extends ResultStream>(action: () =
 	const owner = current?.owner;
 	const id = `pending:${++nextId}`;
 	const record: ModelActivityRecord = {
-		id, agentId: owner?.agentId, sessionId: owner?.sessionId,
-		rootSessionId: owner?.rootSessionId, startedAt: Date.now(), observable: false,
+		id,
+		agentId: owner?.agentId,
+		sessionId: owner?.sessionId,
+		rootSessionId: owner?.rootSessionId,
+		startedAt: Date.now(),
+		observable: false,
 	};
 	if (pendingTransports.size < MAX_ACTIVE_RECORDS) pendingTransports.set(id, record);
 	else rememberUnavailable(record);
 	const clear = () => pendingTransports.delete(id);
 	try {
 		const stream = scope.run({ ...current, observationId: id }, action);
-		try { void stream.result().then(clear, clear); }
-		catch { clear(); rememberUnavailable(record); }
+		try {
+			void stream.result().then(clear, clear);
+		} catch {
+			clear();
+			rememberUnavailable(record);
+		}
 		return stream;
 	} catch (error) {
 		clear();
