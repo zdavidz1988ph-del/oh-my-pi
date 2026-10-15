@@ -28,6 +28,8 @@ jobs:
           tar -xzf "$RUNNER_TEMP/runtime-wrapper/oh-my-pi-pi-natives-18.8.9.tgz" -C packages/natives --strip-components=1 package/native
           npm pack @oh-my-pi/pi-natives-linux-x64@18.8.9 --pack-destination "$RUNNER_TEMP/runtime-native"
           tar -xzf "$RUNNER_TEMP/runtime-native/oh-my-pi-pi-natives-linux-x64-18.8.9.tgz" -C packages/natives/native --strip-components=1 --wildcards 'package/*.node'
+      - name: 构建实际 Linux 程序
+        run: bun packages/coding-agent/scripts/build-binary.ts
       - name: 验证真实身份和模型活动边界
         run: >-
           bun test
@@ -42,8 +44,6 @@ jobs:
           packages/coding-agent/test/rpc-session-settle.test.ts
           packages/coding-agent/test/compaction-speculation.test.ts
           packages/coding-agent/test/rpc-wire-generated.test.ts
-      - name: 构建实际 Linux 程序
-        run: bun packages/coding-agent/scripts/build-binary.ts
       - name: 用空白账号和回环答复实测编译后的程序
         shell: bash
         run: |
