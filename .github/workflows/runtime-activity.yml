@@ -1,0 +1,95 @@
+name: 只读活动接口 Linux 验收
+on:
+  pull_request:
+    branches: [dj-club-18.8.9]
+permissions:
+  contents: read
+concurrency:
+  group: runtime-activity-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.3
+      - name: 安装锁定依赖及同版本官方原生库
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          mkdir -p "$RUNNER_TEMP/runtime-wrapper" "$RUNNER_TEMP/runtime-native" packages/natives/native
+          npm pack @oh-my-pi/pi-natives@18.8.9 --pack-destination "$RUNNER_TEMP/runtime-wrapper"
+          tar -xzf "$RUNNER_TEMP/runtime-wrapper/oh-my-pi-pi-natives-18.8.9.tgz" -C packages/natives --strip-components=1 package/native
+          npm pack @oh-my-pi/pi-natives-linux-x64@18.8.9 --pack-destination "$RUNNER_TEMP/runtime-native"
+          tar -xzf "$RUNNER_TEMP/runtime-native/oh-my-pi-pi-natives-linux-x64-18.8.9.tgz" -C packages/natives/native --strip-components=1 --wildcards 'package/*.node'
+      - name: 验证真实身份和模型活动边界
+        run: >-
+          bun test
+          packages/ai/test/model-activity.test.ts
+          packages/coding-agent/test/local-inference-api.test.ts
+          packages/coding-agent/test/tiny-model-settings-live.test.ts
+          packages/coding-agent/test/issue-1940-repro.test.ts
+          packages/coding-agent/test/sdk-tiny-client-dispose.test.ts
+          packages/coding-agent/test/rpc-runtime-activity.test.ts
+          packages/coding-agent/test/registry/persisted-roster-latch.test.ts
+          packages/coding-agent/test/rpc-extension-ui.test.ts
+          packages/coding-agent/test/rpc-session-settle.test.ts
+          packages/coding-agent/test/compaction-speculation.test.ts
+          packages/coding-agent/test/rpc-wire-generated.test.ts
+      - name: 构建实际 Linux 程序
+        run: bun packages/coding-agent/scripts/build-binary.ts
+      - name: 用空白账号和回环答复实测编译后的程序
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/runtime-activity-smoke.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import os from 'node:os';
+          import path from 'node:path';
+          import {spawn} from 'node:child_process';
+          const binary=path.resolve('packages/coding-agent/dist/omp');
+          const dir=fs.mkdtempSync(path.join(os.tmpdir(),'dj-runtime-proof-'));
+          const arrived=Promise.withResolvers(),release=Promise.withResolvers();
+          let requests=0,child,buffer='',errors='';
+          const frames=[],waiters=new Set();
+          const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+            if(new URL(request.url).pathname.endsWith('/models'))return Response.json({data:[{id:'fake-model'}]});
+            requests++;arrived.resolve();await release.promise;
+            const chunk=delta=>({id:'local-proof',object:'chat.completion.chunk',created:1,model:'fake-model',choices:[{index:0,delta,finish_reason:null}]});
+            const end={...chunk({}),choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:1,completion_tokens:1,total_tokens:2}};
+            return new Response([chunk({role:'assistant',content:'隔离验收完成'}),end].map(x=>'data: '+JSON.stringify(x)+'\n\n').join('')+'data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}});
+          }});
+          function waitFor(predicate){
+            const found=frames.find(predicate);if(found)return Promise.resolve(found);
+            return new Promise((resolve,reject)=>{
+              const timer=setTimeout(()=>{waiters.delete(receive);reject(new Error('等待真实程序超时：'+errors.slice(-1500)));},20000);
+              const receive=frame=>{if(predicate(frame)){clearTimeout(timer);waiters.delete(receive);resolve(frame);}};waiters.add(receive);
+            });
+          }
+          const send=frame=>child.stdin.write(JSON.stringify(frame)+'\n');
+          async function snapshot(id){send({id,type:'get_runtime_activity'});const frame=await waitFor(f=>f.id===id);assert.equal(frame.success,true);assert.equal(frame.data.complete,true);return frame.data;}
+          try{
+            fs.mkdirSync(path.join(dir,'agent'));
+            fs.writeFileSync(path.join(dir,'agent/models.yml'),`providers:\n  fake:\n    baseUrl: http://127.0.0.1:${server.port}/v1\n    auth: none\n    api: openai-completions\n    models:\n      - id: fake-model\n        name: 隔离固定答复\n        reasoning: false\n`);
+            child=spawn(binary,['--mode','rpc','--no-session','--no-extensions','--no-skills','--no-tools','--model','fake/fake-model','--thinking','off'],{cwd:dir,env:{PATH:process.env.PATH,HOME:dir,PI_CODING_AGENT_DIR:path.join(dir,'agent'),XDG_CONFIG_HOME:path.join(dir,'config'),XDG_CACHE_HOME:path.join(dir,'cache'),CI:'1'},stdio:['pipe','pipe','pipe']});
+            child.stderr.on('data',chunk=>{errors+=chunk;});
+            child.stdout.on('data',chunk=>{buffer+=chunk;let index;while((index=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,index);buffer=buffer.slice(index+1);if(!line.trim())continue;const frame=JSON.parse(line);frames.push(frame);for(const receive of [...waiters])receive(frame);}});
+            await waitFor(f=>f.type==='ready');
+            const idle=await snapshot('idle');assert.equal(idle.agents[0].modelRequestIds.length,0);
+            send({id:'prompt',type:'prompt',message:'只回复隔离验收完成'});
+            await Promise.race([arrived.promise,new Promise((_,reject)=>setTimeout(()=>reject(new Error('没有收到回环模型请求')),20000))]);
+            const active=await snapshot('active');assert.ok(active.agents[0].modelRequestIds.length>0);
+            release.resolve();await waitFor(f=>f.type==='session_settled');
+            const ended=await snapshot('ended');assert.equal(ended.agents[0].modelRequestIds.length,0);assert.equal(ended.agents[0].waitingForResult,false);
+            assert.equal(idle.instanceId,active.instanceId);assert.equal(active.instanceId,ended.instanceId);
+            assert.ok(idle.sequence<active.sequence&&active.sequence<ended.sequence);
+            console.log(JSON.stringify({platform:process.platform,idle:idle.complete,activeRequests:active.agents[0].modelRequestIds.length,endedRequests:ended.agents[0].modelRequestIds.length,localRequests:requests,externalModelRequests:0}));
+          }finally{release.resolve();child?.stdin.end();child?.kill();server.stop(true);}
+          JS
+          bun "$RUNNER_TEMP/runtime-activity-smoke.mjs"
